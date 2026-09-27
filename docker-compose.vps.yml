@@ -1,0 +1,29 @@
+services:
+  db:
+    mem_limit: 256m
+    restart: unless-stopped
+    command:
+      - postgres
+      - -c
+      - shared_buffers=64MB
+      - -c
+      - max_connections=40
+      - -c
+      - work_mem=4MB
+      - -c
+      - maintenance_work_mem=32MB
+  redis:
+    mem_limit: 64m
+    restart: unless-stopped
+    command:
+      - redis-server
+      - --maxmemory
+      - 48mb
+      - --maxmemory-policy
+      - allkeys-lru
+  migrate:
+    mem_limit: 128m
+  api:
+    mem_limit: 160m
+  worker:
+    mem_limit: 320m
