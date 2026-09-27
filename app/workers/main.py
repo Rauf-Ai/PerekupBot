@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 import redis.asyncio as redis
 from aiogram import Bot
 from sqlalchemy import select
+from sqlalchemy.orm import selectinload
 from telethon import TelegramClient, events
 from app.bot.handlers import create_dispatcher
 from app.collectors.avito import AvitoCollector
@@ -15,7 +16,7 @@ from app.collectors.telegram import TelegramCollector
 from app.collectors.vk import VKCollector
 from app.extractors.rules import RuleListingExtractor
 from app.config.settings import get_settings
-from app.db.models import CollectorRun, Source, utcnow
+from app.db.models import CollectorRun, Source, User, utcnow
 from app.db.seeds import seed_sources
 from app.db.session import SessionLocal
 from app.services.notifications import send_notification, send_pending
@@ -24,6 +25,26 @@ from app.services.pipeline import ingest
 log = logging.getLogger(__name__)
 COLLECTORS = {"avito": AvitoCollector, "autoru": AutoRuCollector, "drom": DromCollector,
               "vk": VKCollector, "mock": MockCollector}
+
+
+def source_needed(kind: str) -> bool:
+    """Avoid polling a billable/shared source when no active user selected it."""
+    settings = get_settings()
+    now = utcnow()
+    admin_ids = {settings.telegram_admin_id} if settings.telegram_admin_id is not None else set()
+    admin_ids.update(int(value.strip()) for value in settings.telegram_admin_ids.split(",")
+                     if value.strip().isdigit())
+    with SessionLocal() as db:
+        users = db.scalars(select(User).options(selectinload(User.filters))).all()
+    for user in users:
+        filters = user.filters
+        if not filters or not filters.search_enabled:
+            continue
+        has_access = user.telegram_id in admin_ids or (
+            user.active and (user.subscription_expires_at is None or user.subscription_expires_at > now))
+        if has_access and kind in (filters.selected_sources or ["telegram", "avito", "autoru", "drom"]):
+            return True
+    return False
 
 
 async def process_items(source: Source, items, bot: Bot, run_id: int) -> None:
@@ -92,6 +113,9 @@ async def source_loop(source: Source, bot: Bot, client: TelegramClient | None, r
             await asyncio.sleep(startup_delay)
     while True:
         try:
+            if not source_needed(source.kind):
+                await asyncio.sleep(source.interval_seconds)
+                continue
             lock_key = f"collector-lock:{source.key}"
             token = uuid.uuid4().hex
             acquired = await redis_client.set(lock_key, token, nx=True, ex=max(300, source.interval_seconds * 2))

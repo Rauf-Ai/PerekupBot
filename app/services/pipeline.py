@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from sqlalchemy import or_, select
 from sqlalchemy.orm import selectinload
-from app.db.models import Listing, ListingAlias, ListingPhoto, Notification, PriceHistory, User, UserFilter
+from app.db.models import Listing, ListingAlias, ListingPhoto, Notification, PriceHistory, Source, User, UserFilter
 from app.db.session import SessionLocal
 from app.config.settings import get_settings
 from app.schemas.listing import ListingInput
@@ -63,6 +63,7 @@ def ingest(item: ListingInput) -> IngestResult:
             elif old_price is not None and listing.price < old_price:
                 event_key = f"price:{history.id}"
         if event_key:
+            source_kind = db.scalar(select(Source.kind).where(Source.id == item.source_id))
             settings = get_settings()
             admin_ids = {settings.telegram_admin_id} if settings.telegram_admin_id is not None else set()
             admin_ids.update(int(value.strip()) for value in settings.telegram_admin_ids.split(",")
@@ -77,7 +78,10 @@ def ingest(item: ListingInput) -> IngestResult:
             users = []
         ids = []
         for user in users:
-            if user.filters and matches_filter(listing, user.filters):
+            filters = user.filters
+            if (filters and filters.search_enabled and
+                    source_kind in (filters.selected_sources or ["telegram", "avito", "autoru", "drom"]) and
+                    matches_filter(listing, filters)):
                 notification = Notification(user_id=user.id, listing_id=listing.id, event_key=event_key, created_at=now)
                 db.add(notification)
                 db.flush()

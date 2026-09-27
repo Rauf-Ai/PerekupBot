@@ -1,6 +1,8 @@
 from html import escape
 from datetime import datetime, timedelta, timezone
+import json
 import re
+from pathlib import Path
 from aiogram import Dispatcher, F, Router
 from aiogram import BaseMiddleware
 from aiogram.filters import Command
@@ -16,6 +18,10 @@ from app.services.notifications import build_card, card_keyboard
 from app.config.settings import get_settings
 
 router = Router()
+
+_GEO_PATH = Path(__file__).resolve().parents[1] / "config" / "geography.json"
+GEO_REGIONS = json.loads(_GEO_PATH.read_text(encoding="utf-8"))["regions"]
+REGION_NAMES = [region["name"] for region in GEO_REGIONS]
 
 
 def _admin_ids() -> set[int]:
@@ -33,12 +39,23 @@ def _is_owner(telegram_id: int) -> bool:
 # Commercial package proposal. Only the 30-day access grant is enforced by the MVP;
 # report/search quotas and faster polling remain product targets, not active limits.
 PLANS = {
-    "solo": {"title": "Старт", "price": 990, "reports": 1, "alerts": 100, "speed": "до 60 мин", "seats": 1},
-    "plus": {"title": "Плюс", "price": 2490, "reports": 3, "alerts": 500, "speed": "до 30 мин", "seats": 1},
-    "pro": {"title": "Профи", "price": 4990, "reports": 8, "alerts": 1500, "speed": "до 15 мин", "seats": 1},
-    "business": {"title": "Бизнес", "price": 9990, "reports": 20, "alerts": 4000, "speed": "до 5 мин", "seats": 1},
-    "team": {"title": "Команда", "price": 14990, "reports": 40, "alerts": 8000, "speed": "до 2 мин", "seats": 5},
+    "solo": {"title": "Старт", "price": 990, "duration_days": 30, "reports": 1, "alerts": 100, "speed": "до 60 мин", "seats": 1},
+    "plus": {"title": "Плюс", "price": 2490, "duration_days": 30, "reports": 3, "alerts": 500, "speed": "до 30 мин", "seats": 1},
+    "pro": {"title": "Профи", "price": 4990, "duration_days": 30, "reports": 8, "alerts": 1500, "speed": "до 15 мин", "seats": 1},
+    "business": {"title": "Бизнес", "price": 9990, "duration_days": 30, "reports": 20, "alerts": 4000, "speed": "до 5 мин", "seats": 1},
+    "team": {"title": "Команда", "price": 14990, "duration_days": None, "reports": 40, "alerts": 8000, "speed": "до 2 мин", "seats": 5},
 }
+
+SOURCE_LABELS = {
+    "telegram": "Telegram",
+    "avito": "Авито",
+    "autoru": "Auto.ru",
+    "drom": "Дром",
+}
+
+def _plan_period(plan: dict) -> str:
+    days = plan.get("duration_days", 30)
+    return "навсегда" if days is None else f"{days} дней"
 
 
 class UserAccessMiddleware(BaseMiddleware):
@@ -66,8 +83,8 @@ class UserAccessMiddleware(BaseMiddleware):
 
 router.message.outer_middleware(UserAccessMiddleware())
 router.callback_query.outer_middleware(UserAccessMiddleware())
-REGIONS = ["Татарстан", "Чувашия", "Марий Эл"]
-FIELDS = {"cities": "города", "brands": "марки", "models": "модели", "min_year": "минимальный год",
+LEGACY_REGIONS = ["Татарстан", "Чувашия", "Марий Эл"]
+FIELDS = {"brands": "марки", "models": "модели", "min_year": "минимальный год",
           "max_mileage": "максимальный пробег"}
 
 
@@ -110,7 +127,9 @@ def _get_user(telegram_id: int, username: str | None = None) -> User:
         if pending:
             user.active = True
             user.subscription_plan = pending.subscription_plan
-            user.subscription_expires_at = now + timedelta(days=30)
+            plan = PLANS.get(pending.subscription_plan or "", {})
+            days = plan.get("duration_days", 30)
+            user.subscription_expires_at = now + timedelta(days=days) if days is not None else None
             db.delete(pending)
         return user
 
@@ -124,7 +143,7 @@ def _admin_keyboard() -> InlineKeyboardMarkup:
 
 
 def _user_admin_keyboard(user: User) -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton(text=f"{plan['title']} — {plan['price']:,} ₽ / 30 дней".replace(",", " "),
+    rows = [[InlineKeyboardButton(text=f"{plan['title']} — {plan['price']:,} ₽ / {_plan_period(plan)}".replace(",", " "),
                                   callback_data=f"admin:plan:{user.id}:{code}")]
             for code, plan in PLANS.items()]
     if user.active:
@@ -135,7 +154,7 @@ def _user_admin_keyboard(user: User) -> InlineKeyboardMarkup:
 
 def _pending_admin_keyboard(grant: PendingAccessGrant) -> InlineKeyboardMarkup:
     rows = [[InlineKeyboardButton(
-        text=f"{plan['title']} — {plan['price']:,} ₽ / 30 дней".replace(",", " "),
+        text=f"{plan['title']} — {plan['price']:,} ₽ / {_plan_period(plan)}".replace(",", " "),
         callback_data=f"admin:pending_plan:{grant.id}:{code}",
     )] for code, plan in PLANS.items()]
     rows.append([InlineKeyboardButton(text="Отменить", callback_data=f"admin:pending_cancel:{grant.id}")])
@@ -149,7 +168,8 @@ def _admin_user_text(user: User) -> str:
     if expiry and expiry.tzinfo is None:
         expiry = expiry.replace(tzinfo=timezone.utc)
     state = "✅ доступ открыт" if user.active and (expiry is None or expiry > datetime.now(timezone.utc)) else "🔒 доступ закрыт"
-    until = expiry.astimezone(timezone.utc).strftime("%d.%m.%Y %H:%M UTC") if expiry else "—"
+    until = (expiry.astimezone(timezone.utc).strftime("%d.%m.%Y %H:%M UTC") if expiry
+             else ("навсегда" if plan.get("duration_days") is None else "—"))
     username = f"@{escape(user.username)}" if user.username else "username не указан"
     return (f"<b>Пользователь</b> {username}\n"
             f"ID: <code>{user.telegram_id}</code>\n"
@@ -159,18 +179,18 @@ def _admin_user_text(user: User) -> str:
 
 
 def _tariff_proposal_text() -> str:
-    lines = ["<b>Тарифы на 30 дней — предложение</b>"]
+    lines = ["<b>Тарифы</b>"]
     for plan in PLANS.values():
         cost = plan["reports"] * 90
         lines.append(
-            f"\n<b>{plan['title']} — {plan['price']:,} ₽</b>".replace(",", " ")
+            f"\n<b>{plan['title']} — {plan['price']:,} ₽ / {_plan_period(plan)}</b>".replace(",", " ")
             + f"\n• до {plan['alerts']:,} объявлений/мес.; цель по задержке: {plan['speed']}"
             .replace(",", " ")
             + f"\n• {plan['reports']} отч. Автотеки (себестоимость около {cost:,} ₽)".replace(",", " ")
             + f"\n• пользователей: до {plan['seats']}"
         )
     lines.append(
-        "\n<i>В текущем MVP назначение тарифа открывает доступ на 30 дней. "
+        "\n<i>В текущем MVP назначение тарифа открывает доступ на указанный срок; тариф Команда за 14 990 ₽ действует навсегда. "
         "Квоты объявлений и отчётов, а также ускоренная проверка пока не включены. "
         "Сейчас Telegram-каналы дают быстрые события, а Apify-источники проверяются примерно раз в час.</i>"
     )
@@ -180,30 +200,119 @@ def _tariff_proposal_text() -> str:
 def _settings_text(filters: UserFilter) -> str:
     def show(items):
         return escape(", ".join(items)) if items else "любые"
+    selected_sources = [SOURCE_LABELS[key] for key in (filters.selected_sources or []) if key in SOURCE_LABELS]
+    city_map = filters.cities_by_region or {}
+    custom_city_count = sum(len(cities) for cities in city_map.values())
+    city_text = f"выбрано городов: {custom_city_count}" if city_map else ("все города регионов" if not filters.cities else show(filters.cities))
     return ("<b>Настройки поиска</b>\n"
+            f"Поиск: {'🟢 включён' if filters.search_enabled else '⏸ остановлен'}\n"
             f"Бюджет: {filters.max_price:,} ₽\n".replace(",", " ")
-            + f"Регионы: {show(filters.regions)}\nГорода: {show(filters.cities)}\n"
+            + f"Регионы: {escape(', '.join(filters.regions)) if filters.regions else 'не выбраны'}\nГорода: {city_text}\n"
+            + f"Источники: {escape(', '.join(selected_sources)) if selected_sources else 'не выбраны'}\n"
             + f"Марки: {show(filters.brands)}\nМодели: {show(filters.models)}\n"
             + f"Год от: {filters.min_year or 'любой'}\nПробег до: {filters.max_mileage or 'любой'}\n"
             + f"Продавец: {filters.seller_type or 'любой'}")
 
 
 def _settings_keyboard(filters: UserFilter) -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton(text="100 тыс.", callback_data="budget:100000"),
-             InlineKeyboardButton(text="200 тыс.", callback_data="budget:200000"),
-             InlineKeyboardButton(text="300 тыс.", callback_data="budget:300000"),
-             InlineKeyboardButton(text="Своя сумма", callback_data="edit:max_price")]]
-    for i, region in enumerate(REGIONS):
-        rows.append([InlineKeyboardButton(text=("✅ " if region in filters.regions else "▫️ ") + region,
-                                          callback_data=f"region:{i}")])
-    rows += [[InlineKeyboardButton(text="Города", callback_data="edit:cities"),
-              InlineKeyboardButton(text="Марки", callback_data="edit:brands"),
-              InlineKeyboardButton(text="Модели", callback_data="edit:models")],
-             [InlineKeyboardButton(text="Год от", callback_data="edit:min_year"),
-              InlineKeyboardButton(text="Пробег до", callback_data="edit:max_mileage")],
-             [InlineKeyboardButton(text="Любой продавец", callback_data="seller:any"),
-              InlineKeyboardButton(text="Частник", callback_data="seller:private"),
-              InlineKeyboardButton(text="Дилер", callback_data="seller:dealer")]]
+    search_action = ("⏸ Остановить поиск" if filters.search_enabled else "▶️ Возобновить поиск")
+    search_callback = "search:stop" if filters.search_enabled else "search:resume"
+    rows = [
+        [InlineKeyboardButton(text=f"💰 Бюджет · {filters.max_price:,} ₽".replace(",", " "), callback_data="menu:budget")],
+        [InlineKeyboardButton(text="📍 Выбрать гео", callback_data="geo:home:0"),
+         InlineKeyboardButton(text="🔎 Источники", callback_data="menu:sources")],
+        [InlineKeyboardButton(text="⚙️ Другие фильтры", callback_data="menu:filters"),
+         InlineKeyboardButton(text="👤 Профиль / подписка", callback_data="menu:profile")],
+        [InlineKeyboardButton(text="📘 Инструкция", callback_data="menu:help")],
+        [InlineKeyboardButton(text=search_action, callback_data=search_callback)],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _budget_keyboard() -> InlineKeyboardMarkup:
+    values = [(100000, "100 тыс."), (200000, "200 тыс."), (300000, "300 тыс."),
+              (500000, "500 тыс."), (1000000, "1 млн"), (3000000, "3 млн")]
+    rows = [[InlineKeyboardButton(text=label, callback_data=f"budget:{value}") for value, label in values[i:i + 3]]
+            for i in range(0, len(values), 3)]
+    rows += [[InlineKeyboardButton(text="✍️ Своя сумма", callback_data="budget:custom")],
+             [InlineKeyboardButton(text="↩️ Настройки", callback_data="menu:settings")]]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _filters_keyboard(filters: UserFilter) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(text="Марки", callback_data="edit:brands"),
+             InlineKeyboardButton(text="Модели", callback_data="edit:models")],
+            [InlineKeyboardButton(text="Год от", callback_data="edit:min_year"),
+             InlineKeyboardButton(text="Пробег до", callback_data="edit:max_mileage")],
+            [InlineKeyboardButton(text="Любой продавец", callback_data="seller:any"),
+             InlineKeyboardButton(text="Частник", callback_data="seller:private"),
+             InlineKeyboardButton(text="Дилер", callback_data="seller:dealer")],
+            [InlineKeyboardButton(text="↩️ Настройки", callback_data="menu:settings")]]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _source_keyboard(filters: UserFilter) -> InlineKeyboardMarkup:
+    selected = set(filters.selected_sources or [])
+    rows = [[InlineKeyboardButton(
+        text=f"{'✅' if key in selected else '▫️'} {label}", callback_data=f"source:toggle:{key}")]
+        for key, label in SOURCE_LABELS.items()]
+    rows.append([InlineKeyboardButton(text="↩️ Настройки", callback_data="menu:settings")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _geo_keyboard(filters: UserFilter, page: int = 0) -> InlineKeyboardMarkup:
+    per_page = 8
+    page_count = max(1, (len(GEO_REGIONS) + per_page - 1) // per_page)
+    page = max(0, min(page, page_count - 1))
+    rows = [[InlineKeyboardButton(text="🇷🇺 Все регионы · все города", callback_data="geo:all")]]
+    for index in range(page * per_page, min((page + 1) * per_page, len(GEO_REGIONS))):
+        name = GEO_REGIONS[index]["name"]
+        mark = "✅" if name in filters.regions else "▫️"
+        rows.append([
+            InlineKeyboardButton(text=f"{mark} {name}", callback_data=f"geo:toggle:{index}:{page}"),
+            InlineKeyboardButton(text="🏙 Города", callback_data=f"geo:cities:{index}:0:{page}"),
+        ])
+    page_buttons = []
+    if page > 0:
+        page_buttons.append(InlineKeyboardButton(text="◀️", callback_data=f"geo:home:{page - 1}"))
+    page_buttons.append(InlineKeyboardButton(text=f"{page + 1}/{page_count}", callback_data="geo:noop"))
+    if page + 1 < page_count:
+        page_buttons.append(InlineKeyboardButton(text="▶️", callback_data=f"geo:home:{page + 1}"))
+    rows.append(page_buttons)
+    rows.append([InlineKeyboardButton(text="↩️ Настройки", callback_data="menu:settings")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _geo_city_keyboard(filters: UserFilter, region_index: int, page: int, region_page: int = 0) -> InlineKeyboardMarkup:
+    region = GEO_REGIONS[region_index]
+    cities = region["cities"]
+    per_page = 8
+    page_count = max(1, (len(cities) + per_page - 1) // per_page)
+    page = max(0, min(page, page_count - 1))
+    city_map = filters.cities_by_region or {}
+    manual = region["name"] in city_map
+    chosen = set(city_map.get(region["name"], []))
+    rows = [[InlineKeyboardButton(
+        text=("✅ Регион выбран" if region["name"] in filters.regions else "▫️ Добавить регион"),
+        callback_data=f"geo:toggle:{region_index}:{region_page}")]]
+    if manual:
+        rows.append([InlineKeyboardButton(text="🌐 Все города региона", callback_data=f"geo:allcities:{region_index}:{page}:{region_page}")])
+    else:
+        rows.append([InlineKeyboardButton(text="🎯 Выбрать конкретные города", callback_data=f"geo:manual:{region_index}:{page}:{region_page}")])
+    for city_index in range(page * per_page, min((page + 1) * per_page, len(cities))):
+        city = cities[city_index]
+        checked = city in chosen if manual else True
+        rows.append([InlineKeyboardButton(
+            text=f"{'✅' if checked else '▫️'} {city}",
+            callback_data=f"geo:city:{region_index}:{city_index}:{page}:{region_page}")])
+    page_buttons = []
+    if page > 0:
+        page_buttons.append(InlineKeyboardButton(text="◀️", callback_data=f"geo:cities:{region_index}:{page - 1}:{region_page}"))
+    page_buttons.append(InlineKeyboardButton(text=f"{page + 1}/{page_count}", callback_data="geo:noop"))
+    if page + 1 < page_count:
+        page_buttons.append(InlineKeyboardButton(text="▶️", callback_data=f"geo:cities:{region_index}:{page + 1}:{region_page}"))
+    rows.append(page_buttons)
+    rows.append([InlineKeyboardButton(text="↩️ К регионам", callback_data=f"geo:home:{region_page}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -318,7 +427,7 @@ async def admin_lookup_user(message: Message, state: FSMContext):
         else:
             deadline = grant.claim_expires_at.astimezone(timezone.utc).strftime("%d.%m.%Y")
             await message.answer(
-                f"Пользователь с ID <code>{telegram_id}</code> ещё не запускал бота. Выберите тариф: он начнёт действовать на 30 дней после первого /start.\n"
+                f"Пользователь с ID <code>{telegram_id}</code> ещё не запускал бота. Выберите тариф: срок начнётся после первого /start.\n"
                 f"Ожидающий доступ можно активировать до {deadline}.",
                 parse_mode="HTML", reply_markup=_pending_admin_keyboard(grant))
         return
@@ -347,7 +456,7 @@ async def admin_lookup_user(message: Message, state: FSMContext):
         await state.clear()
         deadline = grant.claim_expires_at.astimezone(timezone.utc).strftime("%d.%m.%Y")
         await message.answer(
-            f"Пользователь @{escape(username)} ещё не запускал бота или не найден. Выберите тариф: он начнёт действовать на 30 дней после первого /start.\n"
+            f"Пользователь @{escape(username)} ещё не запускал бота или не найден. Выберите тариф: срок начнётся после первого /start.\n"
             f"Ожидающий доступ можно активировать до {deadline}.",
             parse_mode="HTML", reply_markup=_pending_admin_keyboard(grant))
         return
@@ -385,7 +494,7 @@ async def admin_assign_pending_plan(callback: CallbackQuery):
         await callback.answer("Срок истёк", show_alert=True)
         return
     await callback.message.edit_text(
-        f"✅ Тариф {plan['title']} подготовлен для {escape(recipient)}. Он начнёт действовать на 30 дней после первого /start.\n"
+        f"✅ Тариф {plan['title']} подготовлен для {escape(recipient)}. Срок действия: {_plan_period(plan)} после первого /start.\n"
         f"Ожидающий доступ действителен до {deadline}; попросите пользователя открыть бота и нажать /start.",
         parse_mode="HTML", reply_markup=_admin_keyboard())
     await callback.answer("Доступ будет включён после /start")
@@ -444,20 +553,24 @@ async def admin_assign_plan(callback: CallbackQuery):
         if not user or user.telegram_id in _admin_ids():
             await callback.answer("Пользователь не найден", show_alert=True)
             return
-        expiry = user.subscription_expires_at
-        if expiry is None or (expiry.replace(tzinfo=timezone.utc) if expiry.tzinfo is None else expiry) < now:
-            expiry = now
-        elif expiry.tzinfo is None:
-            expiry = expiry.replace(tzinfo=timezone.utc)
         user.active = True
         user.subscription_plan = plan_code
-        user.subscription_expires_at = expiry + timedelta(days=30)
+        duration = plan.get("duration_days", 30)
+        if duration is None:
+            user.subscription_expires_at = None
+        else:
+            expiry = user.subscription_expires_at
+            if expiry is None or (expiry.replace(tzinfo=timezone.utc) if expiry.tzinfo is None else expiry) < now:
+                expiry = now
+            elif expiry.tzinfo is None:
+                expiry = expiry.replace(tzinfo=timezone.utc)
+            user.subscription_expires_at = expiry + timedelta(days=duration)
         telegram_id = user.telegram_id
         username = user.username
-        expires_text = user.subscription_expires_at.strftime("%d.%m.%Y")
+        expires_text = user.subscription_expires_at.strftime("%d.%m.%Y") if user.subscription_expires_at else "навсегда"
     delivery_error = False
     try:
-        await callback.bot.send_message(telegram_id, f"✅ Вам открыт доступ по тарифу {plan['title']} на 30 дней. Доступ активен до {expires_text}.")
+        await callback.bot.send_message(telegram_id, f"✅ Вам открыт доступ по тарифу {plan['title']} на {_plan_period(plan)}. Доступ активен до {expires_text}.")
     except Exception:
         delivery_error = True
     recipient = f"@{escape(username)}" if username else f"ID <code>{telegram_id}</code>"
@@ -504,9 +617,279 @@ async def settings(message: Message):
     await message.answer(_settings_text(user.filters), parse_mode="HTML", reply_markup=_settings_keyboard(user.filters))
 
 
+def _geo_overview_text(filters: UserFilter) -> str:
+    selected = set(filters.regions or [])
+    city_map = filters.cities_by_region or {}
+    lines = ["<b>Выбор географии</b>",
+             f"Выбрано регионов: {len(selected)} из {len(GEO_REGIONS)}.",
+             "Внутри региона можно оставить все города или отметить конкретные."]
+    custom = [f"{name}: {len(cities)}" for name, cities in city_map.items() if name in selected]
+    if custom:
+        lines.append("Города по выбранным регионам: " + "; ".join(custom))
+    else:
+        lines.append("Сейчас включены все города выбранных регионов.")
+    lines.append("⚠️ Список регионов полный, но фактическое покрытие пока ограничено: Telegram-каналы подключены для Татарстана, Чувашии и Марий Эл; Apify для Авито, Auto.ru и Дром настроен на Казань. В остальных регионах сборщики пока не подключены.")
+    return "\n".join(lines)
+
+
+def _geo_city_text(filters: UserFilter, region_index: int) -> str:
+    region = GEO_REGIONS[region_index]
+    selected = set((filters.cities_by_region or {}).get(region["name"], []))
+    manual = region["name"] in (filters.cities_by_region or {})
+    mode = (f"Выбрано городов: {len(selected)}" if manual else "Выбраны все города региона")
+    region_state = "регион включён" if region["name"] in filters.regions else "регион пока не включён"
+    return f"<b>{escape(region['name'])}</b>\n{region_state}. {mode}.\nОтметьте нужные города или оставьте весь регион."
+
+
+def _help_text() -> str:
+    return ("<b>Как пользоваться ботом</b>\n"
+            "1. В «Бюджет» выберите готовую сумму или введите свою. Для своей суммы отправьте только цифры, например <code>350000</code> — без пробелов, точек и ₽.\n"
+            "2. В «Выбрать гео» отметьте регионы. В каждом регионе можно оставить все города или выбрать отдельные.\n"
+            "3. В «Источники» включите площадки, от которых хотите получать объявления.\n"
+            "4. В «Другие фильтры» задайте марки, модели, год, пробег и тип продавца.\n"
+            "5. Новые объявления приходят сюда автоматически. Кнопка «Остановить поиск» приостанавливает ваши уведомления и убирает ваш спрос на проверки.\n"
+            "6. В «Профиль / подписка» видны тариф, срок и состояние поиска. Смену тарифа оформляет администратор.\n\n"
+            "Источники общие для сервиса: проверка площадки продолжается, пока она нужна хотя бы одному активному пользователю. Сейчас внешние Apify-сборщики настроены на Казань, а Telegram-каналы — на Татарстан, Чувашию и Марий Эл."
+            )
+
+
+def _profile_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📍 География", callback_data="geo:home:0"),
+         InlineKeyboardButton(text="🔎 Источники", callback_data="menu:sources")],
+        [InlineKeyboardButton(text="⚙️ Настройки поиска", callback_data="menu:settings")],
+        [InlineKeyboardButton(text="↩️ Назад", callback_data="menu:settings")],
+    ])
+
+
+@router.callback_query(F.data.startswith("menu:"))
+async def menu(callback: CallbackQuery):
+    action = callback.data.split(":", 1)[1]
+    with SessionLocal() as db:
+        user = db.scalar(select(User).options(selectinload(User.filters)).where(User.telegram_id == callback.from_user.id))
+    if not user or not user.filters:
+        await callback.answer("Профиль не найден. Отправьте /start", show_alert=True)
+        return
+    if action == "settings":
+        text, keyboard = _settings_text(user.filters), _settings_keyboard(user.filters)
+    elif action == "budget":
+        text, keyboard = "<b>Бюджет</b>\nВыберите сумму или нажмите «Своя сумма».", _budget_keyboard()
+    elif action == "filters":
+        text, keyboard = "<b>Другие фильтры</b>\nВыберите параметр для изменения.", _filters_keyboard(user.filters)
+    elif action == "sources":
+        text = ("<b>Источники объявлений</b>\nВключайте только нужные площадки. Сервис опрашивает общий источник, пока он нужен хотя бы одному активному пользователю.\n\nСейчас Apify (Авито, Auto.ru, Дром) настроен на Казань; Telegram-каналы подключены для Татарстана, Чувашии и Марий Эл.")
+        keyboard = _source_keyboard(user.filters)
+    elif action == "help":
+        text, keyboard = _help_text(), InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="↩️ Настройки", callback_data="menu:settings")]])
+    elif action == "profile":
+        plan = PLANS.get(user.subscription_plan or "")
+        if plan:
+            expiry = user.subscription_expires_at
+            if expiry and expiry.tzinfo is None:
+                expiry = expiry.replace(tzinfo=timezone.utc)
+            until = expiry.astimezone(timezone.utc).strftime("%d.%m.%Y %H:%M UTC") if expiry else "навсегда"
+            plan_text = f"{plan['title']} — {_plan_period(plan)}, действует до {until}"
+        else:
+            plan_text = "тариф не назначен"
+        state_text = "поиск включён" if user.filters.search_enabled else "поиск остановлен"
+        text = ("<b>Профиль и подписка</b>\n"
+                f"Telegram ID: <code>{user.telegram_id}</code>\n"
+                f"Тариф: {escape(plan_text)}\n"
+                f"Статус: {state_text}\n"
+            f"Источников выбрано: {len(user.filters.selected_sources or [])}\n"
+                f"Регионов выбрано: {len(user.filters.regions or [])}")
+        keyboard = _profile_keyboard()
+    else:
+        await callback.answer("Неизвестный раздел")
+        return
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+    await callback.answer()
+
+
+@router.message(Command("help"))
+async def help_command(message: Message):
+    await message.answer(_help_text(), parse_mode="HTML", reply_markup=InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="⚙️ Настройки", callback_data="menu:settings")]]))
+
+
+@router.callback_query(F.data.startswith("source:toggle:"))
+async def toggle_source(callback: CallbackQuery):
+    source = callback.data.rsplit(":", 1)[-1]
+    if source not in SOURCE_LABELS:
+        await callback.answer("Неизвестный источник", show_alert=True)
+        return
+    with SessionLocal.begin() as db:
+        filters = db.scalar(select(UserFilter).join(User).where(User.telegram_id == callback.from_user.id))
+        selected = set(filters.selected_sources or [])
+        if source in selected:
+            selected.remove(source)
+            result = f"{SOURCE_LABELS[source]} выключен"
+        else:
+            selected.add(source)
+            result = f"{SOURCE_LABELS[source]} включён"
+        filters.selected_sources = [key for key in SOURCE_LABELS if key in selected]
+        keyboard = _source_keyboard(filters)
+    await callback.message.edit_reply_markup(reply_markup=keyboard)
+    await callback.answer(result)
+
+
+@router.callback_query(F.data.startswith("geo:home:"))
+async def geo_home(callback: CallbackQuery):
+    page = int(callback.data.rsplit(":", 1)[-1])
+    with SessionLocal() as db:
+        filters = db.scalar(select(UserFilter).join(User).where(User.telegram_id == callback.from_user.id))
+    await callback.message.edit_text(_geo_overview_text(filters), parse_mode="HTML", reply_markup=_geo_keyboard(filters, page))
+    await callback.answer()
+
+
+@router.callback_query(F.data == "geo:all")
+async def geo_all(callback: CallbackQuery):
+    with SessionLocal.begin() as db:
+        filters = db.scalar(select(UserFilter).join(User).where(User.telegram_id == callback.from_user.id))
+        filters.regions = REGION_NAMES.copy()
+        filters.cities = []
+        filters.cities_by_region = {}
+        text, keyboard = _geo_overview_text(filters), _geo_keyboard(filters)
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+    await callback.answer("Выбраны все регионы и города")
+
+
+@router.callback_query(F.data.startswith("geo:toggle:"))
+async def geo_toggle_region(callback: CallbackQuery):
+    _, _, index_text, page_text = callback.data.split(":", 3)
+    index, page = int(index_text), int(page_text)
+    region_name = GEO_REGIONS[index]["name"]
+    with SessionLocal.begin() as db:
+        filters = db.scalar(select(UserFilter).join(User).where(User.telegram_id == callback.from_user.id))
+        selected = list(filters.regions or [])
+        city_map = dict(filters.cities_by_region or {})
+        if region_name in selected:
+            selected.remove(region_name)
+            city_map.pop(region_name, None)
+            result = "Регион выключен"
+        else:
+            selected.append(region_name)
+            result = "Регион включён"
+        filters.regions = selected
+        filters.cities_by_region = city_map
+        text, keyboard = _geo_overview_text(filters), _geo_keyboard(filters, page)
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+    await callback.answer(result)
+
+
+@router.callback_query(F.data.startswith("geo:cities:"))
+async def geo_cities(callback: CallbackQuery):
+    _, _, index_text, page_text, region_page_text = callback.data.split(":", 4)
+    index, page, region_page = int(index_text), int(page_text), int(region_page_text)
+    with SessionLocal() as db:
+        filters = db.scalar(select(UserFilter).join(User).where(User.telegram_id == callback.from_user.id))
+    await callback.message.edit_text(_geo_city_text(filters, index), parse_mode="HTML",
+                                     reply_markup=_geo_city_keyboard(filters, index, page, region_page))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("geo:manual:"))
+async def geo_manual_cities(callback: CallbackQuery):
+    _, _, index_text, page_text, region_page_text = callback.data.split(":", 4)
+    index, page, region_page = int(index_text), int(page_text), int(region_page_text)
+    name = GEO_REGIONS[index]["name"]
+    with SessionLocal.begin() as db:
+        filters = db.scalar(select(UserFilter).join(User).where(User.telegram_id == callback.from_user.id))
+        regions = list(filters.regions or [])
+        if name not in regions:
+            regions.append(name)
+        filters.regions = regions
+        city_map = dict(filters.cities_by_region or {})
+        city_map[name] = []
+        filters.cities_by_region = city_map
+        filters.cities = []
+        text, keyboard = _geo_city_text(filters, index), _geo_city_keyboard(filters, index, page, region_page)
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+    await callback.answer("Отметьте нужные города")
+
+
+@router.callback_query(F.data.startswith("geo:allcities:"))
+async def geo_all_cities(callback: CallbackQuery):
+    _, _, index_text, page_text, region_page_text = callback.data.split(":", 4)
+    index, page, region_page = int(index_text), int(page_text), int(region_page_text)
+    name = GEO_REGIONS[index]["name"]
+    with SessionLocal.begin() as db:
+        filters = db.scalar(select(UserFilter).join(User).where(User.telegram_id == callback.from_user.id))
+        regions = list(filters.regions or [])
+        if name not in regions:
+            regions.append(name)
+        filters.regions = regions
+        city_map = dict(filters.cities_by_region or {})
+        city_map.pop(name, None)
+        filters.cities_by_region = city_map
+        filters.cities = []
+        text, keyboard = _geo_city_text(filters, index), _geo_city_keyboard(filters, index, page, region_page)
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+    await callback.answer("Включены все города региона")
+
+
+@router.callback_query(F.data.startswith("geo:city:"))
+async def geo_toggle_city(callback: CallbackQuery):
+    _, _, index_text, city_index_text, page_text, region_page_text = callback.data.split(":", 5)
+    index, city_index = int(index_text), int(city_index_text)
+    page, region_page = int(page_text), int(region_page_text)
+    region = GEO_REGIONS[index]
+    name, city = region["name"], region["cities"][city_index]
+    with SessionLocal.begin() as db:
+        filters = db.scalar(select(UserFilter).join(User).where(User.telegram_id == callback.from_user.id))
+        selected_regions = list(filters.regions or [])
+        if name not in selected_regions:
+            selected_regions.append(name)
+        filters.regions = selected_regions
+        city_map = dict(filters.cities_by_region or {})
+        if name not in city_map:
+            city_map[name] = [value for value in region["cities"] if value != city]
+        else:
+            selected = list(city_map[name])
+            if city in selected:
+                selected.remove(city)
+            else:
+                selected.append(city)
+            city_map[name] = selected
+        filters.cities_by_region = city_map
+        filters.cities = []
+        text, keyboard = _geo_city_text(filters, index), _geo_city_keyboard(filters, index, page, region_page)
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+    await callback.answer("Город обновлён")
+
+
+@router.callback_query(F.data == "geo:noop")
+async def geo_noop(callback: CallbackQuery):
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("search:"))
+async def toggle_search(callback: CallbackQuery):
+    enabled = callback.data.endswith("resume")
+    with SessionLocal.begin() as db:
+        filters = db.scalar(select(UserFilter).join(User).where(User.telegram_id == callback.from_user.id))
+        filters.search_enabled = enabled
+        text, keyboard = _settings_text(filters), _settings_keyboard(filters)
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+    await callback.answer("Поиск возобновлён" if enabled else "Поиск остановлен")
+
+
 @router.callback_query(F.data.startswith("budget:"))
-async def budget(callback: CallbackQuery):
-    amount = int(callback.data.split(":", 1)[1])
+async def budget(callback: CallbackQuery, state: FSMContext):
+    raw = callback.data.split(":", 1)[1]
+    if raw == "custom":
+        await state.set_state(EditFilter.value)
+        await state.update_data(field="max_price")
+        await callback.message.answer(
+            "Введите бюджет <b>только цифрами</b>, например <code>350000</code>.\n"
+            "❗ Без пробелов, точек и знака ₽.", parse_mode="HTML")
+        await callback.answer("Жду сумму")
+        return
+    if not raw.isdigit() or not 1 <= int(raw) <= 2_000_000_000:
+        await callback.answer("Некорректная сумма", show_alert=True)
+        return
+    amount = int(raw)
     with SessionLocal.begin() as db:
         filters = db.scalar(select(UserFilter).join(User).where(User.telegram_id == callback.from_user.id))
         filters.max_price = amount
@@ -518,7 +901,11 @@ async def budget(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("region:"))
 async def region(callback: CallbackQuery):
-    region_name = REGIONS[int(callback.data.split(":", 1)[1])]
+    index = int(callback.data.split(":", 1)[1])
+    if index >= len(LEGACY_REGIONS):
+        await callback.answer("Откройте «Выбрать гео»", show_alert=True)
+        return
+    region_name = LEGACY_REGIONS[index]
     with SessionLocal.begin() as db:
         filters = db.scalar(select(UserFilter).join(User).where(User.telegram_id == callback.from_user.id))
         current = list(filters.regions)
@@ -566,7 +953,13 @@ async def edit_value(message: Message, state: FSMContext):
         elif raw.isdigit() and int(raw) > 0:
             value = int(raw)
         else:
-            await message.answer("Введите положительное число или '-' для сброса.")
+            if field == "max_price":
+                await message.answer("❗ Введите сумму только цифрами, например <code>350000</code>: без пробелов, точек и знака ₽.", parse_mode="HTML")
+            else:
+                await message.answer("Введите положительное число или '-' для сброса.")
+            return
+        if field == "max_price" and value is not None and value > 2_000_000_000:
+            await message.answer("Сумма слишком большая. Введите число до 2000000000.")
             return
         if field == "min_year" and value is not None and not 1950 <= value <= 2030:
             await message.answer("Год должен быть от 1950 до 2030.")

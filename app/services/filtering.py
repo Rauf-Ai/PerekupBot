@@ -6,7 +6,15 @@ def matches_filter(listing: Listing, filters: UserFilter) -> bool:
         return False
     if not listing.region or listing.region.casefold() not in {x.casefold() for x in filters.regions}:
         return False
-    if filters.cities and (not listing.city or listing.city.casefold() not in {x.casefold() for x in filters.cities}):
+    city_map = filters.cities_by_region or {}
+    region_cities = next((cities for region, cities in city_map.items()
+                          if listing.region and region.casefold() == listing.region.casefold()), None)
+    if region_cities is not None:
+        # An empty list means that the user entered manual city selection but
+        # has not selected any cities yet, so that region should not match.
+        if not listing.city or listing.city.casefold() not in {city.casefold() for city in region_cities}:
+            return False
+    elif filters.cities and (not listing.city or listing.city.casefold() not in {x.casefold() for x in filters.cities}):
         return False
     if filters.brands and (not listing.brand or listing.brand.casefold() not in {x.casefold() for x in filters.brands}):
         return False
