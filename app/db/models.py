@@ -1,5 +1,5 @@
 from datetime import datetime, timezone
-from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint
+from sqlalchemy import BigInteger, Boolean, CheckConstraint, DateTime, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -37,6 +37,20 @@ class UserFilter(Base):
     max_mileage: Mapped[int | None] = mapped_column(Integer, nullable=True)
     seller_type: Mapped[str | None] = mapped_column(String(30), nullable=True)
     user: Mapped[User] = relationship(back_populates="filters")
+
+
+class PendingAccessGrant(Base):
+    __tablename__ = "pending_access_grants"
+    __table_args__ = (CheckConstraint(
+        "(username IS NOT NULL AND telegram_id IS NULL) OR (username IS NULL AND telegram_id IS NOT NULL)",
+        name="ck_pending_access_grant_single_target",
+    ),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    username: Mapped[str | None] = mapped_column(String(32), unique=True, index=True, nullable=True)
+    telegram_id: Mapped[int | None] = mapped_column(BigInteger, unique=True, index=True, nullable=True)
+    subscription_plan: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    claim_expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
 class Source(Base):
