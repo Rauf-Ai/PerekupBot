@@ -35,6 +35,7 @@ class UserFilter(Base):
     search_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     brands: Mapped[list] = mapped_column(JSON, default=list)
     models: Mapped[list] = mapped_column(JSON, default=list)
+    models_by_brand: Mapped[dict] = mapped_column(JSON, default=dict)
     hidden_models: Mapped[list] = mapped_column(JSON, default=list)
     min_year: Mapped[int | None] = mapped_column(Integer, nullable=True)
     max_mileage: Mapped[int | None] = mapped_column(Integer, nullable=True)

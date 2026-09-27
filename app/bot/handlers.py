@@ -22,6 +22,8 @@ router = Router()
 _GEO_PATH = Path(__file__).resolve().parents[1] / "config" / "geography.json"
 GEO_REGIONS = json.loads(_GEO_PATH.read_text(encoding="utf-8"))["regions"]
 REGION_NAMES = [region["name"] for region in GEO_REGIONS]
+_VEHICLE_PATH = Path(__file__).resolve().parents[1] / "config" / "vehicle_catalog.json"
+VEHICLE_BRANDS = json.loads(_VEHICLE_PATH.read_text(encoding="utf-8"))["brands"]
 
 
 def _admin_ids() -> set[int]:
@@ -62,6 +64,16 @@ class UserAccessMiddleware(BaseMiddleware):
     async def __call__(self, handler, event, data):
         actor = getattr(event, "from_user", None)
         if actor is None or actor.id not in _admin_ids():
+            callback_data = event.data if isinstance(event, CallbackQuery) else ""
+            message_text = (event.text or "") if isinstance(event, Message) else ""
+            public_callback = (callback_data == "menu:profile" or
+                               callback_data.startswith(("support:", "subscription:")))
+            support_command = bool(message_text and
+                                   message_text.split(maxsplit=1)[0].split("@", 1)[0] == "/support")
+            state = data.get("state")
+            in_support_flow = bool(state and await state.get_state() == SupportFlow.message.state)
+            if public_callback or support_command or in_support_flow:
+                return await handler(event, data)
             # Let /start register the username, but never activate a new account by itself.
             if isinstance(event, Message) and event.text and event.text.split(maxsplit=1)[0].split("@", 1)[0] == "/start":
                 return await handler(event, data)
@@ -84,8 +96,7 @@ class UserAccessMiddleware(BaseMiddleware):
 router.message.outer_middleware(UserAccessMiddleware())
 router.callback_query.outer_middleware(UserAccessMiddleware())
 LEGACY_REGIONS = ["Татарстан", "Чувашия", "Марий Эл"]
-FIELDS = {"brands": "марки", "models": "модели", "min_year": "минимальный год",
-          "max_mileage": "максимальный пробег"}
+FIELDS = {"min_year": "минимальный год", "max_mileage": "максимальный пробег"}
 
 
 class EditFilter(StatesGroup):
@@ -94,6 +105,10 @@ class EditFilter(StatesGroup):
 
 class AdminFlow(StatesGroup):
     lookup_target = State()
+
+
+class SupportFlow(StatesGroup):
+    message = State()
 
 
 def _get_user(telegram_id: int, username: str | None = None) -> User:
@@ -201,6 +216,13 @@ def _settings_text(filters: UserFilter) -> str:
     def show(items):
         return escape(", ".join(items)) if items else "любые"
     selected_sources = [SOURCE_LABELS[key] for key in (filters.selected_sources or []) if key in SOURCE_LABELS]
+    models_by_brand = filters.models_by_brand or {}
+    model_summary = "; ".join(
+        f"{brand}: {', '.join(models) if models else 'модели не выбраны'}"
+        for brand, models in models_by_brand.items())
+    if not model_summary:
+        model_summary = ("все модели выбранных марок" if filters.brands else
+                         (", ".join(filters.models) if filters.models else "любые"))
     city_map = filters.cities_by_region or {}
     custom_city_count = sum(len(cities) for cities in city_map.values())
     city_text = f"выбрано городов: {custom_city_count}" if city_map else ("все города регионов" if not filters.cities else show(filters.cities))
@@ -209,7 +231,7 @@ def _settings_text(filters: UserFilter) -> str:
             f"Бюджет: {filters.max_price:,} ₽\n".replace(",", " ")
             + f"Регионы: {escape(', '.join(filters.regions)) if filters.regions else 'не выбраны'}\nГорода: {city_text}\n"
             + f"Источники: {escape(', '.join(selected_sources)) if selected_sources else 'не выбраны'}\n"
-            + f"Марки: {show(filters.brands)}\nМодели: {show(filters.models)}\n"
+            + f"Марки: {show(filters.brands)}\nМодели: {escape(model_summary)}\n"
             + f"Год от: {filters.min_year or 'любой'}\nПробег до: {filters.max_mileage or 'любой'}\n"
             + f"Продавец: {filters.seller_type or 'любой'}")
 
@@ -221,8 +243,9 @@ def _settings_keyboard(filters: UserFilter) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text=f"💰 Бюджет · {filters.max_price:,} ₽".replace(",", " "), callback_data="menu:budget")],
         [InlineKeyboardButton(text="📍 Выбрать гео", callback_data="geo:home:0"),
          InlineKeyboardButton(text="🔎 Источники", callback_data="menu:sources")],
+        [InlineKeyboardButton(text="🚘 Марки и модели", callback_data="menu:vehicles")],
         [InlineKeyboardButton(text="⚙️ Другие фильтры", callback_data="menu:filters"),
-         InlineKeyboardButton(text="👤 Профиль / подписка", callback_data="menu:profile")],
+         InlineKeyboardButton(text="👤 Тариф и поддержка", callback_data="menu:profile")],
         [InlineKeyboardButton(text="📘 Инструкция", callback_data="menu:help")],
         [InlineKeyboardButton(text=search_action, callback_data=search_callback)],
     ]
@@ -240,9 +263,7 @@ def _budget_keyboard() -> InlineKeyboardMarkup:
 
 
 def _filters_keyboard(filters: UserFilter) -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton(text="Марки", callback_data="edit:brands"),
-             InlineKeyboardButton(text="Модели", callback_data="edit:models")],
-            [InlineKeyboardButton(text="Год от", callback_data="edit:min_year"),
+    rows = [[InlineKeyboardButton(text="Год от", callback_data="edit:min_year"),
              InlineKeyboardButton(text="Пробег до", callback_data="edit:max_mileage")],
             [InlineKeyboardButton(text="Любой продавец", callback_data="seller:any"),
              InlineKeyboardButton(text="Частник", callback_data="seller:private"),
@@ -258,6 +279,84 @@ def _source_keyboard(filters: UserFilter) -> InlineKeyboardMarkup:
         for key, label in SOURCE_LABELS.items()]
     rows.append([InlineKeyboardButton(text="↩️ Настройки", callback_data="menu:settings")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _vehicle_keyboard(filters: UserFilter, page: int = 0) -> InlineKeyboardMarkup:
+    per_page = 8
+    page_count = max(1, (len(VEHICLE_BRANDS) + per_page - 1) // per_page)
+    page = max(0, min(page, page_count - 1))
+    selected = {_canonical_vehicle_brand(brand).casefold() for brand in (filters.brands or [])}
+    rows = []
+    for index in range(page * per_page, min((page + 1) * per_page, len(VEHICLE_BRANDS))):
+        brand = VEHICLE_BRANDS[index]["name"]
+        mark = "✅" if brand.casefold() in selected else "▫️"
+        rows.append([
+            InlineKeyboardButton(text=f"{mark} {brand}", callback_data=f"vehicle:brand:{index}"),
+            InlineKeyboardButton(text="Модели", callback_data=f"vehicle:models:{index}:0"),
+        ])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="◀️", callback_data=f"vehicle:home:{page - 1}"))
+    nav.append(InlineKeyboardButton(text=f"{page + 1}/{page_count}", callback_data="vehicle:noop"))
+    if page + 1 < page_count:
+        nav.append(InlineKeyboardButton(text="▶️", callback_data=f"vehicle:home:{page + 1}"))
+    rows += [nav, [InlineKeyboardButton(text="↩️ Настройки", callback_data="menu:settings")]]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _vehicle_text(filters: UserFilter) -> str:
+    brands = list(dict.fromkeys(_canonical_vehicle_brand(brand) for brand in (filters.brands or [])))
+    models_by_brand = filters.models_by_brand or {}
+    selected_models = sum(len(models) for models in models_by_brand.values())
+    brand_text = escape(", ".join(brands)) if brands else "не выбраны"
+    return ("<b>Марки и модели</b>\nВыберите марки в каталоге, затем откройте их модели. "
+            "Если у марки не задан список моделей, поиск идёт по всем моделям этой марки.\n\n"
+            f"Марки: {brand_text}\nВыбрано конкретных моделей: {selected_models}")
+
+
+def _canonical_vehicle_brand(value: str) -> str:
+    normalized = value.strip().casefold()
+    for brand in VEHICLE_BRANDS:
+        if normalized in {name.casefold() for name in [brand["name"], *brand.get("aliases", [])]}:
+            return brand["name"]
+    return value.strip()
+
+
+def _vehicle_models_keyboard(filters: UserFilter, brand_index: int, page: int = 0) -> InlineKeyboardMarkup:
+    brand = VEHICLE_BRANDS[brand_index]
+    models = brand["models"]
+    per_page = 8
+    page_count = max(1, (len(models) + per_page - 1) // per_page)
+    page = max(0, min(page, page_count - 1))
+    chosen = (filters.models_by_brand or {}).get(brand["name"])
+    selected_all = chosen is None
+    selected_brands = {_canonical_vehicle_brand(value).casefold() for value in (filters.brands or [])}
+    rows = [[InlineKeyboardButton(text="✅ Марка выбрана" if brand["name"].casefold() in selected_brands else "▫️ Добавить марку",
+                                  callback_data=f"vehicle:brand:{brand_index}")]]
+    if selected_all:
+        rows.append([InlineKeyboardButton(text="🎯 Выбрать модели вручную", callback_data=f"vehicle:manual:{brand_index}:{page}")])
+    else:
+        rows.append([InlineKeyboardButton(text="🌐 Все модели марки", callback_data=f"vehicle:all:{brand_index}:{page}")])
+    for model_index in range(page * per_page, min((page + 1) * per_page, len(models))):
+        model = models[model_index]
+        checked = selected_all or model in chosen
+        rows.append([InlineKeyboardButton(text=f"{'✅' if checked else '▫️'} {model}",
+                                          callback_data=f"vehicle:model:{brand_index}:{model_index}:{page}")])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="◀️", callback_data=f"vehicle:models:{brand_index}:{page - 1}"))
+    nav.append(InlineKeyboardButton(text=f"{page + 1}/{page_count}", callback_data="vehicle:noop"))
+    if page + 1 < page_count:
+        nav.append(InlineKeyboardButton(text="▶️", callback_data=f"vehicle:models:{brand_index}:{page + 1}"))
+    rows += [nav, [InlineKeyboardButton(text="↩️ К маркам", callback_data="vehicle:home:0")]]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _vehicle_models_text(brand_index: int, filters: UserFilter) -> str:
+    brand = VEHICLE_BRANDS[brand_index]
+    chosen = (filters.models_by_brand or {}).get(brand["name"])
+    selection = "Все модели" if chosen is None else f"Выбрано моделей: {len(chosen)}"
+    return f"<b>{escape(brand['name'])}</b>\n{selection}. Отметьте нужные модели:"
 
 
 def _geo_keyboard(filters: UserFilter, page: int = 0) -> InlineKeyboardMarkup:
@@ -322,14 +421,17 @@ async def start(message: Message):
         return
     user = _get_user(message.from_user.id, message.from_user.username)
     if message.from_user.id not in _admin_ids() and not user.active:
-        await message.answer("🔒 Доступ к поиску пока закрыт. Передайте администратору ваш username или Telegram ID для назначения тарифа.")
+        await message.answer(
+            "🔒 Доступ к поиску пока закрыт. Через профиль можно запросить тариф, а в поддержку — написать администратору.",
+            reply_markup=_profile_keyboard())
         return
     if message.from_user.id not in _admin_ids() and user.subscription_expires_at:
         expiry = user.subscription_expires_at
         if expiry.tzinfo is None:
             expiry = expiry.replace(tzinfo=timezone.utc)
         if expiry <= datetime.now(timezone.utc):
-            await message.answer("⏳ Срок тарифа закончился. Напишите администратору бота для продления доступа.")
+            await message.answer("⏳ Срок тарифа закончился. Запросите продление или напишите в поддержку.",
+                                 reply_markup=_profile_keyboard())
             return
     await message.answer("Поиск автомобилей включен. Новые объявления по вашим фильтрам будут приходить сюда.\n"
                          "Команды: /settings, /search, /latest, /sources")
@@ -646,19 +748,18 @@ def _help_text() -> str:
             "1. В «Бюджет» выберите готовую сумму или введите свою. Для своей суммы отправьте только цифры, например <code>350000</code> — без пробелов, точек и ₽.\n"
             "2. В «Выбрать гео» отметьте регионы. В каждом регионе можно оставить все города или выбрать отдельные.\n"
             "3. В «Источники» включите площадки, от которых хотите получать объявления.\n"
-            "4. В «Другие фильтры» задайте марки, модели, год, пробег и тип продавца.\n"
+            "4. В «Марки и модели» выберите автомобиль из каталога, а в «Другие фильтры» задайте год, пробег и тип продавца.\n"
             "5. Новые объявления приходят сюда автоматически. Кнопка «Остановить поиск» приостанавливает ваши уведомления и убирает ваш спрос на проверки.\n"
-            "6. В «Профиль / подписка» видны тариф, срок и состояние поиска. Смену тарифа оформляет администратор.\n\n"
+            "6. В «Тариф и поддержка» можно посмотреть срок тарифа, отправить запрос на смену тарифа и написать в поддержку. Подключение тарифа подтверждается администратором.\n\n"
             "Источники общие для сервиса: проверка площадки продолжается, пока она нужна хотя бы одному активному пользователю. Сейчас внешние Apify-сборщики настроены на Казань, а Telegram-каналы — на Татарстан, Чувашию и Марий Эл."
             )
 
 
 def _profile_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📍 География", callback_data="geo:home:0"),
-         InlineKeyboardButton(text="🔎 Источники", callback_data="menu:sources")],
-        [InlineKeyboardButton(text="⚙️ Настройки поиска", callback_data="menu:settings")],
-        [InlineKeyboardButton(text="↩️ Назад", callback_data="menu:settings")],
+        [InlineKeyboardButton(text="💳 Управление тарифом", callback_data="subscription:plans")],
+        [InlineKeyboardButton(text="🆘 Обратиться в поддержку", callback_data="support:start")],
+        [InlineKeyboardButton(text="↩️ Главное меню", callback_data="menu:settings")],
     ])
 
 
@@ -676,6 +777,8 @@ async def menu(callback: CallbackQuery):
         text, keyboard = "<b>Бюджет</b>\nВыберите сумму или нажмите «Своя сумма».", _budget_keyboard()
     elif action == "filters":
         text, keyboard = "<b>Другие фильтры</b>\nВыберите параметр для изменения.", _filters_keyboard(user.filters)
+    elif action == "vehicles":
+        text, keyboard = _vehicle_text(user.filters), _vehicle_keyboard(user.filters)
     elif action == "sources":
         text = ("<b>Источники объявлений</b>\nВключайте только нужные площадки. Сервис опрашивает общий источник, пока он нужен хотя бы одному активному пользователю.\n\nСейчас Apify (Авито, Auto.ru, Дром) настроен на Казань; Telegram-каналы подключены для Татарстана, Чувашии и Марий Эл.")
         keyboard = _source_keyboard(user.filters)
@@ -688,17 +791,17 @@ async def menu(callback: CallbackQuery):
             expiry = user.subscription_expires_at
             if expiry and expiry.tzinfo is None:
                 expiry = expiry.replace(tzinfo=timezone.utc)
-            until = expiry.astimezone(timezone.utc).strftime("%d.%m.%Y %H:%M UTC") if expiry else "навсегда"
-            plan_text = f"{plan['title']} — {_plan_period(plan)}, действует до {until}"
+            if expiry and expiry <= datetime.now(timezone.utc):
+                plan_text = f"{plan['title']} — срок закончился"
+            else:
+                until = expiry.astimezone(timezone.utc).strftime("%d.%m.%Y %H:%M UTC") if expiry else "навсегда"
+                plan_text = f"{plan['title']} — {_plan_period(plan)}, действует до {until}"
         else:
             plan_text = "тариф не назначен"
-        state_text = "поиск включён" if user.filters.search_enabled else "поиск остановлен"
         text = ("<b>Профиль и подписка</b>\n"
                 f"Telegram ID: <code>{user.telegram_id}</code>\n"
-                f"Тариф: {escape(plan_text)}\n"
-                f"Статус: {state_text}\n"
-            f"Источников выбрано: {len(user.filters.selected_sources or [])}\n"
-                f"Регионов выбрано: {len(user.filters.regions or [])}")
+                f"Текущий тариф: {escape(plan_text)}\n"
+                "Для смены тарифа отправьте запрос администратору. Поддержка отвечает в этом чате.")
         keyboard = _profile_keyboard()
     else:
         await callback.answer("Неизвестный раздел")
@@ -711,6 +814,222 @@ async def menu(callback: CallbackQuery):
 async def help_command(message: Message):
     await message.answer(_help_text(), parse_mode="HTML", reply_markup=InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text="⚙️ Настройки", callback_data="menu:settings")]]))
+
+
+@router.callback_query(F.data.startswith("vehicle:home:"))
+async def vehicle_home(callback: CallbackQuery):
+    page = int(callback.data.rsplit(":", 1)[-1])
+    with SessionLocal() as db:
+        filters = db.scalar(select(UserFilter).join(User).where(User.telegram_id == callback.from_user.id))
+    await callback.message.edit_text(_vehicle_text(filters), parse_mode="HTML",
+                                     reply_markup=_vehicle_keyboard(filters, page))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("vehicle:brand:"))
+async def vehicle_toggle_brand(callback: CallbackQuery):
+    index = int(callback.data.rsplit(":", 1)[-1])
+    if not 0 <= index < len(VEHICLE_BRANDS):
+        await callback.answer("Марка не найдена", show_alert=True)
+        return
+    brand = VEHICLE_BRANDS[index]["name"]
+    with SessionLocal.begin() as db:
+        filters = db.scalar(select(UserFilter).join(User).where(User.telegram_id == callback.from_user.id))
+        selected = list(filters.brands or [])
+        selected_canonical = {_canonical_vehicle_brand(value).casefold() for value in selected}
+        model_map = dict(filters.models_by_brand or {})
+        if brand.casefold() in selected_canonical:
+            selected = [value for value in selected if _canonical_vehicle_brand(value).casefold() != brand.casefold()]
+            model_map.pop(brand, None)
+            result = f"{brand} удалена"
+        else:
+            selected.append(brand)
+            result = f"{brand} добавлена; выберите конкретные модели или оставьте все"
+        filters.brands = selected
+        filters.models_by_brand = model_map
+        text, keyboard = _vehicle_text(filters), _vehicle_keyboard(filters)
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+    await callback.answer(result)
+
+
+@router.callback_query(F.data.startswith("vehicle:models:"))
+async def vehicle_models(callback: CallbackQuery):
+    _, _, index_text, page_text = callback.data.split(":", 3)
+    index, page = int(index_text), int(page_text)
+    if not 0 <= index < len(VEHICLE_BRANDS):
+        await callback.answer("Марка не найдена", show_alert=True)
+        return
+    with SessionLocal() as db:
+        filters = db.scalar(select(UserFilter).join(User).where(User.telegram_id == callback.from_user.id))
+    await callback.message.edit_text(_vehicle_models_text(index, filters), parse_mode="HTML",
+                                     reply_markup=_vehicle_models_keyboard(filters, index, page))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("vehicle:manual:"))
+async def vehicle_manual_models(callback: CallbackQuery):
+    _, _, index_text, page_text = callback.data.split(":", 3)
+    index, page = int(index_text), int(page_text)
+    brand = VEHICLE_BRANDS[index]["name"]
+    with SessionLocal.begin() as db:
+        filters = db.scalar(select(UserFilter).join(User).where(User.telegram_id == callback.from_user.id))
+        selected = list(filters.brands or [])
+        if brand not in selected:
+            selected.append(brand)
+        filters.brands = selected
+        model_map = dict(filters.models_by_brand or {})
+        model_map[brand] = []
+        filters.models_by_brand = model_map
+        text, keyboard = _vehicle_models_text(index, filters), _vehicle_models_keyboard(filters, index, page)
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+    await callback.answer("Отметьте подходящие модели")
+
+
+@router.callback_query(F.data.startswith("vehicle:all:"))
+async def vehicle_all_models(callback: CallbackQuery):
+    _, _, index_text, page_text = callback.data.split(":", 3)
+    index, page = int(index_text), int(page_text)
+    brand = VEHICLE_BRANDS[index]["name"]
+    with SessionLocal.begin() as db:
+        filters = db.scalar(select(UserFilter).join(User).where(User.telegram_id == callback.from_user.id))
+        model_map = dict(filters.models_by_brand or {})
+        model_map.pop(brand, None)
+        filters.models_by_brand = model_map
+        selected = list(filters.brands or [])
+        if brand not in selected:
+            selected.append(brand)
+        filters.brands = selected
+        text, keyboard = _vehicle_models_text(index, filters), _vehicle_models_keyboard(filters, index, page)
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+    await callback.answer("Включены все модели марки")
+
+
+@router.callback_query(F.data.startswith("vehicle:model:"))
+async def vehicle_toggle_model(callback: CallbackQuery):
+    _, _, index_text, model_index_text, page_text = callback.data.split(":", 4)
+    index, model_index, page = int(index_text), int(model_index_text), int(page_text)
+    brand_data = VEHICLE_BRANDS[index]
+    if not 0 <= model_index < len(brand_data["models"]):
+        await callback.answer("Модель не найдена", show_alert=True)
+        return
+    brand, model = brand_data["name"], brand_data["models"][model_index]
+    with SessionLocal.begin() as db:
+        filters = db.scalar(select(UserFilter).join(User).where(User.telegram_id == callback.from_user.id))
+        brands = list(filters.brands or [])
+        if brand not in brands:
+            brands.append(brand)
+        filters.brands = brands
+        model_map = dict(filters.models_by_brand or {})
+        if brand not in model_map:
+            # The catalog screen starts in "all models" mode. Unchecking one
+            # model converts it to an explicit all-except-this selection.
+            model_map[brand] = [name for name in brand_data["models"] if name != model]
+        else:
+            selected = list(model_map[brand])
+            if model in selected:
+                selected.remove(model)
+            else:
+                selected.append(model)
+            model_map[brand] = selected
+        filters.models_by_brand = model_map
+        text, keyboard = _vehicle_models_text(index, filters), _vehicle_models_keyboard(filters, index, page)
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+    await callback.answer("Модель обновлена")
+
+
+@router.callback_query(F.data == "vehicle:noop")
+async def vehicle_noop(callback: CallbackQuery):
+    await callback.answer()
+
+
+@router.callback_query(F.data == "subscription:plans")
+async def subscription_plans(callback: CallbackQuery):
+    rows = [[InlineKeyboardButton(
+        text=f"Запросить: {plan['title']} · {plan['price']:,} ₽ / {_plan_period(plan)}".replace(",", " "),
+        callback_data=f"subscription:request:{code}")]
+        for code, plan in PLANS.items()]
+    rows.append([InlineKeyboardButton(text="↩️ Профиль", callback_data="menu:profile")])
+    await callback.message.edit_text(
+        "<b>Управление тарифом</b>\nВыберите тариф, чтобы отправить запрос администратору. "
+        "Оплата и включение тарифа подтверждаются вручную.", parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("subscription:request:"))
+async def subscription_request(callback: CallbackQuery):
+    code = callback.data.rsplit(":", 1)[-1]
+    plan = PLANS.get(code)
+    owner_id = get_settings().telegram_admin_id
+    if not plan or not owner_id:
+        await callback.answer("Не удалось отправить запрос. Напишите в поддержку.", show_alert=True)
+        return
+    username = f"@{callback.from_user.username}" if callback.from_user.username else "без username"
+    await callback.bot.send_message(
+        owner_id,
+        f"💳 Запрос тарифа «{plan['title']}» ({plan['price']} ₽ / {_plan_period(plan)}).\n"
+        f"Пользователь: {username}\nID: <code>{callback.from_user.id}</code>", parse_mode="HTML")
+    await callback.message.edit_text(
+        f"Запрос на тариф «{escape(plan['title'])}» отправлен администратору. "
+        "Он свяжется с вами в этом чате после подтверждения.", parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="↩️ Профиль", callback_data="menu:profile")]]))
+    await callback.answer("Запрос отправлен")
+
+
+@router.callback_query(F.data == "support:start")
+async def support_start(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(SupportFlow.message)
+    await callback.message.answer(
+        "Напишите сообщение в поддержку или отправьте фото/файл. Я передам его администратору.\n"
+        "Для отмены отправьте /cancel.")
+    await callback.answer()
+
+
+@router.message(Command("support"))
+async def support_command(message: Message, state: FSMContext):
+    await state.set_state(SupportFlow.message)
+    await message.answer("Напишите сообщение в поддержку или отправьте фото/файл. Для отмены отправьте /cancel.")
+
+
+@router.message(SupportFlow.message)
+async def support_message(message: Message, state: FSMContext):
+    if not message.from_user:
+        return
+    if message.text and message.text.split(maxsplit=1)[0].split("@", 1)[0] == "/cancel":
+        await state.clear()
+        await message.answer("Обращение отменено.")
+        return
+    owner_id = get_settings().telegram_admin_id
+    if not owner_id:
+        await state.clear()
+        await message.answer("Поддержка временно недоступна. Попробуйте позже.")
+        return
+    username = f"@{message.from_user.username}" if message.from_user.username else "без username"
+    await message.bot.send_message(
+        owner_id,
+        f"🆘 Обращение в поддержку\nID пользователя: {message.from_user.id}\n"
+        f"Пользователь: {escape(username)}\nОтветьте на это сообщение, чтобы написать пользователю.",
+        parse_mode="HTML")
+    await message.bot.copy_message(chat_id=owner_id, from_chat_id=message.chat.id,
+                                   message_id=message.message_id)
+    await state.clear()
+    await message.answer("Сообщение передано в поддержку. Ответ придёт сюда в боте.")
+
+
+@router.message(F.reply_to_message)
+async def support_admin_reply(message: Message):
+    if not message.from_user or not _is_owner(message.from_user.id) or not message.reply_to_message:
+        return
+    source_text = message.reply_to_message.text or message.reply_to_message.caption or ""
+    match = re.search(r"ID пользователя:\s*(\d+)", source_text)
+    if not match:
+        return
+    target_id = int(match.group(1))
+    await message.bot.send_message(target_id, "✉️ Ответ поддержки:")
+    await message.bot.copy_message(chat_id=target_id, from_chat_id=message.chat.id,
+                                   message_id=message.message_id)
+    await message.answer("Ответ отправлен пользователю.")
 
 
 @router.callback_query(F.data.startswith("source:toggle:"))
