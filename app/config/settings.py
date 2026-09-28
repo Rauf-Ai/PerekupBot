@@ -13,6 +13,7 @@ class Settings(BaseSettings):
     telegram_api_hash: str = ""
     telegram_session_path: str = "data/telegram"
     apify_token: str = ""
+    apify_tokens: str = ""
     vk_token: str = ""
     sources_config: str = "app/config/sources.json"
     log_level: str = "INFO"
