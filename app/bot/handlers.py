@@ -5,16 +5,18 @@ import re
 from pathlib import Path
 from aiogram import Dispatcher, F, Router
 from aiogram import BaseMiddleware
+from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import selectinload
-from app.db.models import Listing, PendingAccessGrant, Source, User, UserFilter
+from app.db.models import Listing, PendingAccessGrant, Source, User, UserFilter, UserTelegramSource
 from app.db.session import SessionLocal
 from app.services.filtering import matches_filter
 from app.services.notifications import build_card, card_keyboard
+from app.services.custom_sources import custom_source_key, custom_source_limit, parse_telegram_source
 from app.config.settings import get_settings
 
 router = Router()
@@ -41,11 +43,11 @@ def _is_owner(telegram_id: int) -> bool:
 # Commercial package proposal. Only the 30-day access grant is enforced by the MVP;
 # report/search quotas and faster polling remain product targets, not active limits.
 PLANS = {
-    "solo": {"title": "Старт", "price": 990, "duration_days": 30, "reports": 1, "alerts": 100, "speed": "до 60 мин", "seats": 1},
-    "plus": {"title": "Плюс", "price": 2490, "duration_days": 30, "reports": 3, "alerts": 500, "speed": "до 30 мин", "seats": 1},
-    "pro": {"title": "Профи", "price": 4990, "duration_days": 30, "reports": 8, "alerts": 1500, "speed": "до 15 мин", "seats": 1},
-    "business": {"title": "Бизнес", "price": 9990, "duration_days": 30, "reports": 20, "alerts": 4000, "speed": "до 5 мин", "seats": 1},
-    "team": {"title": "Команда", "price": 14990, "duration_days": None, "reports": 40, "alerts": 8000, "speed": "до 2 мин", "seats": 5},
+    "solo": {"title": "Старт", "price": 990, "duration_days": 30, "reports": 1, "alerts": 100, "speed": "до 60 мин", "seats": 1, "custom_channels": 0},
+    "plus": {"title": "Плюс", "price": 2490, "duration_days": 30, "reports": 3, "alerts": 500, "speed": "до 30 мин", "seats": 1, "custom_channels": 0},
+    "pro": {"title": "Профи", "price": 4990, "duration_days": 30, "reports": 8, "alerts": 1500, "speed": "до 15 мин", "seats": 1, "custom_channels": 3},
+    "business": {"title": "Бизнес", "price": 9990, "duration_days": 30, "reports": 20, "alerts": 4000, "speed": "до 5 мин", "seats": 1, "custom_channels": 10},
+    "team": {"title": "Команда", "price": 14990, "duration_days": None, "reports": 40, "alerts": 8000, "speed": "до 2 мин", "seats": 5, "custom_channels": 20},
 }
 
 SOURCE_LABELS = {
@@ -109,6 +111,11 @@ class AdminFlow(StatesGroup):
 
 class SupportFlow(StatesGroup):
     message = State()
+
+
+class CustomTelegramFlow(StatesGroup):
+    link = State()
+    region = State()
 
 
 def _get_user(telegram_id: int, username: str | None = None) -> User:
@@ -203,6 +210,8 @@ def _tariff_proposal_text() -> str:
             .replace(",", " ")
             + f"\n• {plan['reports']} отч. Автотеки (себестоимость около {cost:,} ₽)".replace(",", " ")
             + f"\n• пользователей: до {plan['seats']}"
+            + (f"\n• свои Telegram-каналы: до {plan['custom_channels']}"
+               if plan["custom_channels"] else "")
         )
     lines.append(
         "\n<i>В текущем MVP назначение тарифа открывает доступ на указанный срок; тариф Команда за 14 990 ₽ действует навсегда. "
@@ -277,7 +286,30 @@ def _source_keyboard(filters: UserFilter) -> InlineKeyboardMarkup:
     rows = [[InlineKeyboardButton(
         text=f"{'✅' if key in selected else '▫️'} {label}", callback_data=f"source:toggle:{key}")]
         for key, label in SOURCE_LABELS.items()]
+    rows.append([InlineKeyboardButton(text="➕ Добавить свой Telegram-канал", callback_data="custom:add")])
+    rows.append([InlineKeyboardButton(text="📋 Мои Telegram-каналы", callback_data="custom:list")])
     rows.append([InlineKeyboardButton(text="↩️ Настройки", callback_data="menu:settings")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _custom_region_keyboard(filters: UserFilter, page: int = 0) -> InlineKeyboardMarkup:
+    per_page = 8
+    page_count = max(1, (len(GEO_REGIONS) + per_page - 1) // per_page)
+    page = max(0, min(page, page_count - 1))
+    selected = [i for i, region in enumerate(GEO_REGIONS) if region["name"] in (filters.regions or [])]
+    rows = [[InlineKeyboardButton(text=f"📍 {GEO_REGIONS[i]['name']}", callback_data=f"custom:region:{i}")]
+            for i in selected[:3] if i < page * per_page or i >= (page + 1) * per_page]
+    for index in range(page * per_page, min((page + 1) * per_page, len(GEO_REGIONS))):
+        region = GEO_REGIONS[index]["name"]
+        rows.append([InlineKeyboardButton(text=f"{'✅ ' if index in selected else ''}{region}",
+                                        callback_data=f"custom:region:{index}")])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="◀️", callback_data=f"custom:regionpage:{page - 1}"))
+    nav.append(InlineKeyboardButton(text=f"{page + 1}/{page_count}", callback_data="custom:noop"))
+    if page + 1 < page_count:
+        nav.append(InlineKeyboardButton(text="▶️", callback_data=f"custom:regionpage:{page + 1}"))
+    rows.append(nav)
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -747,7 +779,7 @@ def _help_text() -> str:
     return ("<b>Как пользоваться ботом</b>\n"
             "1. В «Бюджет» выберите готовую сумму или введите свою. Для своей суммы отправьте только цифры, например <code>350000</code> — без пробелов, точек и ₽.\n"
             "2. В «Выбрать гео» отметьте регионы. В каждом регионе можно оставить все города или выбрать отдельные.\n"
-            "3. В «Источники» включите площадки, от которых хотите получать объявления.\n"
+            "3. В «Источники» включите площадки, от которых хотите получать объявления. На тарифах «Профи», «Бизнес» и «Команда» там можно добавить свои Telegram-каналы и чаты.\n"
             "4. В «Марки и модели» выберите автомобиль из каталога, а в «Другие фильтры» задайте год, пробег и тип продавца.\n"
             "5. Новые объявления приходят сюда автоматически. Кнопка «Остановить поиск» приостанавливает ваши уведомления и убирает ваш спрос на проверки.\n"
             "6. В «Тариф и поддержка» можно посмотреть срок тарифа, отправить запрос на смену тарифа и написать в поддержку. Подключение тарифа подтверждается администратором.\n\n"
@@ -780,7 +812,7 @@ async def menu(callback: CallbackQuery):
     elif action == "vehicles":
         text, keyboard = _vehicle_text(user.filters), _vehicle_keyboard(user.filters)
     elif action == "sources":
-        text = ("<b>Источники объявлений</b>\nВключайте только нужные площадки. Сервис опрашивает общий источник, пока он нужен хотя бы одному активному пользователю.\n\nСейчас Apify (Авито, Auto.ru, Дром) настроен на Казань; Telegram-каналы подключены для Татарстана, Чувашии и Марий Эл.")
+        text = ("<b>Источники объявлений</b>\nВключайте только нужные площадки. Telegram-каналы распределены по регионам: при выборе Казани бот отслеживает источники Татарстана.\n\nСвой канал или чат можно добавить на тарифах «Профи», «Бизнес» и «Команда». Для закрытого чата нужна действующая ссылка-приглашение. Авито, Auto.ru и Дром пока настроены на Казань.")
         keyboard = _source_keyboard(user.filters)
     elif action == "help":
         text, keyboard = _help_text(), InlineKeyboardMarkup(inline_keyboard=[
@@ -1030,6 +1062,194 @@ async def support_admin_reply(message: Message):
     await message.bot.copy_message(chat_id=target_id, from_chat_id=message.chat.id,
                                    message_id=message.message_id)
     await message.answer("Ответ отправлен пользователю.")
+
+
+@router.callback_query(F.data == "custom:add")
+async def custom_add(callback: CallbackQuery, state: FSMContext):
+    with SessionLocal() as db:
+        user = db.scalar(select(User).where(User.telegram_id == callback.from_user.id))
+        limit = custom_source_limit(user.subscription_plan if user else None,
+                                    is_admin=callback.from_user.id in _admin_ids())
+        count = (db.scalar(select(func.count(UserTelegramSource.id)).where(
+            UserTelegramSource.user_id == user.id)) or 0) if user else 0
+    if not limit:
+        await callback.answer("Свои каналы доступны с тарифа «Профи» (4 990 ₽).", show_alert=True)
+        return
+    if count >= limit:
+        await callback.answer(f"Лимит ваших каналов: {limit}. Удалите один из списка или смените тариф.", show_alert=True)
+        return
+    await state.set_state(CustomTelegramFlow.link)
+    await callback.message.answer(
+        "<b>Отправьте одну ссылку на Telegram-чат или канал</b>\n"
+        "Формат: <code>https://t.me/имя_канала</code>, <code>@имя_канала</code> "
+        "или действующая ссылка <code>https://t.me/+...</code> для закрытого чата.\n"
+        "Для отмены отправьте /cancel.", parse_mode="HTML")
+    await callback.answer()
+
+
+@router.message(CustomTelegramFlow.link)
+async def custom_link(message: Message, state: FSMContext):
+    if not message.text:
+        await message.answer("❗ Отправьте ссылку текстом: <code>https://t.me/имя_канала</code>.", parse_mode="HTML")
+        return
+    if message.text.strip() == "/cancel":
+        await state.clear()
+        await message.answer("Добавление отменено.")
+        return
+    parsed = parse_telegram_source(message.text)
+    if not parsed:
+        await message.answer("❗ Нужна ссылка вида <code>https://t.me/имя_канала</code>, "
+                             "<code>https://t.me/+код</code> или <code>@имя_канала</code>. "
+                             "Ссылку на отдельный пост присылать не нужно.", parse_mode="HTML")
+        return
+    identifier, title = parsed
+    if not identifier.startswith("invite:"):
+        try:
+            chat = await message.bot.get_chat(f"@{identifier}")
+        except TelegramAPIError:
+            await message.answer("❗ Telegram не нашёл этот публичный канал или чат. Проверьте ссылку и отправьте её ещё раз.")
+            return
+        if chat.type not in ("channel", "supergroup", "group"):
+            await message.answer("❗ Нужен канал или групповой чат, а не личный аккаунт.")
+            return
+        title = chat.title or title
+    await state.update_data(identifier=identifier, title=title)
+    await state.set_state(CustomTelegramFlow.region)
+    with SessionLocal() as db:
+        filters = db.scalar(select(UserFilter).join(User).where(User.telegram_id == message.from_user.id))
+    await message.answer("<b>Выберите регион канала</b>\nСначала показаны ваши выбранные регионы. "
+                         "Если объявления из разных регионов, выберите основной; город из текста объявления уточнит его регион.",
+                         parse_mode="HTML", reply_markup=_custom_region_keyboard(filters))
+
+
+@router.callback_query(F.data.startswith("custom:regionpage:"))
+async def custom_region_page(callback: CallbackQuery, state: FSMContext):
+    if await state.get_state() != CustomTelegramFlow.region.state:
+        await callback.answer("Начните добавление канала заново.", show_alert=True)
+        return
+    page = int(callback.data.rsplit(":", 1)[-1])
+    with SessionLocal() as db:
+        filters = db.scalar(select(UserFilter).join(User).where(User.telegram_id == callback.from_user.id))
+    await callback.message.edit_reply_markup(reply_markup=_custom_region_keyboard(filters, page))
+    await callback.answer()
+
+
+@router.message(CustomTelegramFlow.region)
+async def custom_region_message(message: Message, state: FSMContext):
+    if message.text and message.text.strip() == "/cancel":
+        await state.clear()
+        await message.answer("Добавление отменено.")
+        return
+    await message.answer("❗ Выберите регион кнопкой под предыдущим сообщением или отправьте /cancel для отмены.")
+
+
+@router.callback_query(F.data.startswith("custom:region:"))
+async def custom_region(callback: CallbackQuery, state: FSMContext):
+    if await state.get_state() != CustomTelegramFlow.region.state:
+        await callback.answer("Начните добавление канала заново.", show_alert=True)
+        return
+    index = int(callback.data.rsplit(":", 1)[-1])
+    if index < 0 or index >= len(GEO_REGIONS):
+        await callback.answer("Неизвестный регион", show_alert=True)
+        return
+    data = await state.get_data()
+    identifier, title = data["identifier"], data["title"]
+    region = GEO_REGIONS[index]["name"]
+    with SessionLocal.begin() as db:
+        user = db.scalar(select(User).options(selectinload(User.filters)).where(
+            User.telegram_id == callback.from_user.id))
+        limit = custom_source_limit(user.subscription_plan if user else None,
+                                    is_admin=callback.from_user.id in _admin_ids())
+        count = (db.scalar(select(func.count(UserTelegramSource.id)).where(
+            UserTelegramSource.user_id == user.id)) or 0) if user else 0
+        if not user or not limit or count >= limit:
+            result = "Тариф не позволяет добавить ещё один канал."
+        else:
+            key = custom_source_key(identifier)
+            source = db.scalar(select(Source).where(Source.key == key))
+            if source is None and not identifier.startswith("invite:"):
+                source = next((item for item in db.scalars(select(Source).where(Source.kind == "telegram")).all()
+                               if item.identifier.casefold() == identifier.casefold()), None)
+            if source is not None and not (source.config or {}).get("custom"):
+                result = "Этот канал уже входит в общие источники. Включите Telegram и нужный регион в настройках."
+            else:
+                if source is None:
+                    source = Source(key=key, kind="telegram", identifier=identifier, region=region,
+                                    config={"custom": True, "title": title}, enabled=True, interval_seconds=30)
+                    db.add(source)
+                    db.flush()
+                else:
+                    source.enabled = True
+                    region = source.region
+                existing = db.scalar(select(UserTelegramSource).where(
+                    UserTelegramSource.user_id == user.id, UserTelegramSource.source_id == source.id))
+                if existing:
+                    result = "Этот канал уже есть в вашем списке."
+                else:
+                    db.add(UserTelegramSource(user_id=user.id, source_id=source.id))
+                    if region not in (user.filters.regions or []):
+                        user.filters.regions = [*(user.filters.regions or []), region]
+                    if "telegram" not in (user.filters.selected_sources or []):
+                        user.filters.selected_sources = [*(user.filters.selected_sources or []), "telegram"]
+                    result = (f"✅ {title} добавлен. Регион: {region}. "
+                              "Проверка начнётся примерно через 30 секунд; старые посты не рассылаются. "
+                              "Если поиск остановлен, возобновите его в главном меню.")
+    await state.clear()
+    await callback.message.edit_text(escape(result), parse_mode="HTML", reply_markup=InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="📋 Мои Telegram-каналы", callback_data="custom:list")],
+                         [InlineKeyboardButton(text="↩️ Источники", callback_data="menu:sources")]]))
+    await callback.answer()
+
+
+@router.callback_query(F.data == "custom:list")
+async def custom_list(callback: CallbackQuery):
+    with SessionLocal() as db:
+        user = db.scalar(select(User).where(User.telegram_id == callback.from_user.id))
+        sources = (db.scalars(select(Source).join(UserTelegramSource,
+            UserTelegramSource.source_id == Source.id).where(UserTelegramSource.user_id == user.id)
+            .order_by(Source.id)).all() if user else [])
+        limit = custom_source_limit(user.subscription_plan if user else None,
+                                    is_admin=callback.from_user.id in _admin_ids())
+    lines = [f"<b>Мои Telegram-каналы</b> · {len(sources)}/{limit}"]
+    rows = []
+    for source in sources:
+        title = (source.config or {}).get("title") or ("Закрытый чат" if source.identifier.startswith("invite:") else f"@{source.identifier}")
+        state_text = " · подключается" if source.identifier.startswith("invite:") else ""
+        if (source.config or {}).get("resolution_error"):
+            state_text = " · проверьте ссылку-приглашение"
+        lines.append(f"• {escape(title)} — {escape(source.region or 'регион не указан')}{state_text}")
+        rows.append([InlineKeyboardButton(text=f"❌ Удалить {title[:25]}", callback_data=f"custom:remove:{source.id}")])
+    if not sources:
+        lines.append("Пока нет добавленных каналов.")
+    rows.append([InlineKeyboardButton(text="➕ Добавить", callback_data="custom:add")])
+    rows.append([InlineKeyboardButton(text="↩️ Источники", callback_data="menu:sources")])
+    await callback.message.edit_text("\n".join(lines), parse_mode="HTML",
+                                     reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("custom:remove:"))
+async def custom_remove(callback: CallbackQuery):
+    source_id = int(callback.data.rsplit(":", 1)[-1])
+    with SessionLocal.begin() as db:
+        user = db.scalar(select(User).where(User.telegram_id == callback.from_user.id))
+        link = (db.scalar(select(UserTelegramSource).where(UserTelegramSource.user_id == user.id,
+            UserTelegramSource.source_id == source_id)) if user else None)
+        if link:
+            db.delete(link)
+            db.flush()
+            remaining = db.scalar(select(func.count(UserTelegramSource.id)).where(
+                UserTelegramSource.source_id == source_id)) or 0
+            if not remaining:
+                source = db.get(Source, source_id)
+                if source and (source.config or {}).get("custom"):
+                    source.enabled = False
+    await custom_list(callback)
+
+
+@router.callback_query(F.data == "custom:noop")
+async def custom_noop(callback: CallbackQuery):
+    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("source:toggle:"))
@@ -1300,7 +1520,11 @@ async def sources(message: Message):
         rows = db.scalars(select(Source).order_by(Source.kind, Source.key)).all()
     lines = ["<b>Источники</b>"]
     for source in rows:
-        lines.append(f"{'✅' if source.enabled else '▫️'} {escape(source.kind)}: {escape(source.identifier)}")
+        if (source.config or {}).get("custom"):
+            continue
+        title = (source.config or {}).get("title") or source.identifier
+        region = f" — {source.region}" if source.region else ""
+        lines.append(f"{'✅' if source.enabled else '▫️'} {escape(source.kind)}: {escape(title)}{escape(region)}")
     await message.answer("\n".join(lines)[:4000], parse_mode="HTML")
 
 
@@ -1312,7 +1536,14 @@ async def latest(message: Message):
     with SessionLocal() as db:
         listings = db.scalars(select(Listing).options(selectinload(Listing.photos), selectinload(Listing.source))
                               .order_by(Listing.first_seen_at.desc()).limit(100)).all()
-        selected = [listing for listing in listings if matches_filter(listing, user.filters)][:5]
+        personal_source_ids = set(db.scalars(select(UserTelegramSource.source_id).where(
+            UserTelegramSource.user_id == user.id)).all())
+        selected = [listing for listing in listings
+                    if listing.source.kind in (user.filters.selected_sources or ["telegram", "avito", "autoru", "drom"])
+                    and (not (listing.source.config or {}).get("custom") or
+                         (listing.source_id in personal_source_ids and custom_source_limit(
+                             user.subscription_plan, is_admin=user.telegram_id in _admin_ids())))
+                    and matches_filter(listing, user.filters)][:5]
         cards = [(build_card(item, item.source.kind.capitalize(), "new"), card_keyboard(item)) for item in selected]
     if not cards:
         await message.answer("Пока нет объявлений по текущим фильтрам.")

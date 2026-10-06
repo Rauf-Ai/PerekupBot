@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import threading
+import time
 from datetime import datetime, timedelta
 from apify_client import ApifyClient
 from app.config.settings import get_settings
@@ -12,7 +13,8 @@ from app.extractors.rules import extract_brand_model
 logger = logging.getLogger(__name__)
 _token_lock = threading.Lock()
 _next_token_index = 0
-_quota_exhausted_tokens: set[str] = set()
+_quota_exhausted_tokens: dict[str, float] = {}
+_QUOTA_RETRY_SECONDS = 6 * 60 * 60
 
 
 def _configured_tokens() -> list[str]:
@@ -27,23 +29,26 @@ def _configured_tokens() -> list[str]:
 def _next_available_token(tokens: list[str]) -> str | None:
     global _next_token_index
     with _token_lock:
+        now = time.monotonic()
         for _ in range(len(tokens)):
             index = _next_token_index % len(tokens)
             _next_token_index = (index + 1) % len(tokens)
             token = tokens[index]
-            if token not in _quota_exhausted_tokens:
+            if _quota_exhausted_tokens.get(token, 0) <= now:
                 return token
     return None
 
 
 def _is_monthly_limit_error(error: Exception) -> bool:
     message = str(error).lower()
-    return "monthly usage hard limit exceeded" in message or "monthly usage limit exceeded" in message
+    return ("monthly usage hard limit exceeded" in message or
+            "monthly usage limit exceeded" in message or
+            ("remaining usage" in message and "billing cycle" in message and "isn't enough for this run" in message))
 
 
 def _mark_token_exhausted(token: str) -> None:
     with _token_lock:
-        _quota_exhausted_tokens.add(token)
+        _quota_exhausted_tokens[token] = time.monotonic() + _QUOTA_RETRY_SECONDS
 
 
 def _date(value):
@@ -100,7 +105,7 @@ class ApifyCollector(BaseCollector):
                 _mark_token_exhausted(token)
                 logger.warning("Apify monthly hard limit reached for one API account; trying next configured token")
         if rows is None:
-            raise RuntimeError("All configured Apify API tokens have reached their monthly usage limit")
+            raise RuntimeError("All configured Apify API tokens currently lack sufficient usage credit")
         items = []
         for row in rows:
             item = self.map_row(row)

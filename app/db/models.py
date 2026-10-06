@@ -71,6 +71,15 @@ class Source(Base):
     last_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
+class UserTelegramSource(Base):
+    __tablename__ = "user_telegram_sources"
+    __table_args__ = (UniqueConstraint("user_id", "source_id"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    source_id: Mapped[int] = mapped_column(ForeignKey("sources.id", ondelete="CASCADE"), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class Listing(Base):
     __tablename__ = "listings"
     __table_args__ = (

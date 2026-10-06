@@ -7,6 +7,8 @@ from aiogram import Bot
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 from telethon import TelegramClient, events
+from telethon import utils as telegram_utils
+from telethon.tl.functions.messages import CheckChatInviteRequest, ImportChatInviteRequest
 from app.bot.handlers import create_dispatcher
 from app.collectors.avito import AvitoCollector
 from app.collectors.autoru import AutoRuCollector
@@ -16,10 +18,11 @@ from app.collectors.telegram import TelegramCollector
 from app.collectors.vk import VKCollector
 from app.extractors.rules import RuleListingExtractor
 from app.config.settings import get_settings
-from app.db.models import CollectorRun, Source, User, utcnow
+from app.db.models import CollectorRun, Source, User, UserTelegramSource, utcnow
 from app.db.seeds import seed_sources
 from app.db.session import SessionLocal
 from app.services.notifications import send_notification, send_pending
+from app.services.custom_sources import custom_source_limit
 from app.services.pipeline import ingest
 
 log = logging.getLogger(__name__)
@@ -27,8 +30,8 @@ COLLECTORS = {"avito": AvitoCollector, "autoru": AutoRuCollector, "drom": DromCo
               "vk": VKCollector, "mock": MockCollector}
 
 
-def source_needed(kind: str) -> bool:
-    """Avoid polling a billable/shared source when no active user selected it."""
+def source_needed(source: Source) -> bool:
+    """Poll only sources selected by an active user in a covered region."""
     settings = get_settings()
     now = utcnow()
     admin_ids = {settings.telegram_admin_id} if settings.telegram_admin_id is not None else set()
@@ -36,13 +39,21 @@ def source_needed(kind: str) -> bool:
                      if value.strip().isdigit())
     with SessionLocal() as db:
         users = db.scalars(select(User).options(selectinload(User.filters))).all()
+        subscribers = (set(db.scalars(select(UserTelegramSource.user_id).where(
+            UserTelegramSource.source_id == source.id)).all())
+            if (source.config or {}).get("custom") else set())
+    regions = set((source.config or {}).get("regions") or ([source.region] if source.region else []))
     for user in users:
         filters = user.filters
         if not filters or not filters.search_enabled:
             continue
         has_access = user.telegram_id in admin_ids or (
             user.active and (user.subscription_expires_at is None or user.subscription_expires_at > now))
-        if has_access and kind in (filters.selected_sources or ["telegram", "avito", "autoru", "drom"]):
+        if (has_access and source.kind in (filters.selected_sources or ["telegram", "avito", "autoru", "drom"])
+                and (not regions or regions.intersection(filters.regions or []))
+                and (not (source.config or {}).get("custom") or
+                     (user.id in subscribers and custom_source_limit(
+                         user.subscription_plan, is_admin=user.telegram_id in admin_ids)))):
             return True
     return False
 
@@ -113,7 +124,10 @@ async def source_loop(source: Source, bot: Bot, client: TelegramClient | None, r
             await asyncio.sleep(startup_delay)
     while True:
         try:
-            if not source_needed(source.kind):
+            if source.kind == "telegram" and (client is None or not client.is_connected()):
+                await asyncio.sleep(source.interval_seconds)
+                continue
+            if not source_needed(source):
                 await asyncio.sleep(source.interval_seconds)
                 continue
             lock_key = f"collector-lock:{source.key}"
@@ -129,6 +143,103 @@ async def source_loop(source: Source, bot: Bot, client: TelegramClient | None, r
         except Exception:
             log.exception("collector_loop_failed source=%s", source.key)
         await asyncio.sleep(source.interval_seconds)
+
+
+async def maintain_telegram_connection(client: TelegramClient):
+    """Resume Telethon after a permanent network disconnect without stopping Bot API polling."""
+    while True:
+        try:
+            await client.run_until_disconnected()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("telegram_connection_lost")
+        log.warning("telegram_disconnected_reconnecting")
+        delay = 5
+        while not client.is_connected():
+            try:
+                await client.connect()
+                if not await client.is_user_authorized():
+                    raise RuntimeError("Telegram user session is no longer authorized")
+                log.info("telegram_reconnected")
+                break
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("telegram_reconnect_failed")
+                if client.is_connected():
+                    await client.disconnect()
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 60)
+
+
+def _rebuild_telegram_maps(sources: list[Source], by_username: dict, by_chat_id: dict) -> None:
+    by_username.clear()
+    by_chat_id.clear()
+    for source in sources:
+        if source.kind != "telegram":
+            continue
+        identifier = source.identifier
+        if identifier.startswith("-100") and identifier[1:].isdigit():
+            by_chat_id[int(identifier)] = source
+        elif not identifier.startswith("invite:"):
+            by_username[identifier.casefold().lstrip("@")] = source
+
+
+async def _resolve_private_source(source: Source, client: TelegramClient) -> bool:
+    if not source.identifier.startswith("invite:"):
+        return True
+    if not client.is_connected():
+        return False
+    invite_hash = source.identifier.split(":", 1)[1]
+    try:
+        invite = await client(CheckChatInviteRequest(invite_hash))
+        if not getattr(invite, "chat", None):
+            await client(ImportChatInviteRequest(invite_hash))
+            invite = await client(CheckChatInviteRequest(invite_hash))
+        chat = invite.chat
+        source.identifier = str(telegram_utils.get_peer_id(chat))
+        with SessionLocal.begin() as db:
+            stored = db.get(Source, source.id)
+            stored.identifier = source.identifier
+            stored.config = {**(stored.config or {}), "title": getattr(chat, "title", "Закрытый чат"),
+                             "resolution_error": None}
+        log.info("telegram_private_source_joined source_id=%s", source.id)
+        return True
+    except Exception as error:
+        with SessionLocal.begin() as db:
+            stored = db.get(Source, source.id)
+            stored.config = {**(stored.config or {}), "resolution_error": type(error).__name__}
+        log.warning("telegram_private_source_unavailable source_id=%s error=%s", source.id, type(error).__name__)
+        return False
+
+
+async def source_registry_loop(bot: Bot, client: TelegramClient | None, redis_client,
+                               source_tasks: dict[int, asyncio.Task], by_username: dict, by_chat_id: dict):
+    """Pick up user-added Telegram channels without restarting the bot."""
+    while True:
+        try:
+            with SessionLocal() as db:
+                sources = db.scalars(select(Source).where(Source.enabled.is_(True))).all()
+            ready = []
+            for source in sources:
+                if source.kind == "telegram" and client is None:
+                    continue
+                if source.kind == "telegram" and not await _resolve_private_source(source, client):
+                    continue
+                ready.append(source)
+                if source.id not in source_tasks or source_tasks[source.id].done():
+                    source_tasks[source.id] = asyncio.create_task(source_loop(source, bot, client, redis_client))
+            active_ids = {source.id for source in ready}
+            for source_id in list(source_tasks):
+                if source_id not in active_ids:
+                    source_tasks.pop(source_id).cancel()
+            _rebuild_telegram_maps(ready, by_username, by_chat_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("source_registry_failed")
+        await asyncio.sleep(30)
 
 
 async def retry_loop(bot: Bot):
@@ -161,7 +272,9 @@ async def main():
             log.error("Telegram user session is not authorized; run python -m app.tools.telegram_login")
             await client.disconnect()
             client = None
-    source_by_username = {source.identifier.casefold().lstrip("@"): source for source in sources if source.kind == "telegram"}
+    source_by_username: dict[str, Source] = {}
+    source_by_chat_id: dict[int, Source] = {}
+    _rebuild_telegram_maps(sources, source_by_username, source_by_chat_id)
     if source_by_username and client is None:
         log.warning("telegram_user_session_unavailable sources=%s; only Bot API channel posts can be received",
                     len(source_by_username))
@@ -170,8 +283,11 @@ async def main():
         @client.on(events.MessageEdited)
         async def on_telegram_message(event):
             chat = await event.get_chat()
-            source = source_by_username.get((getattr(chat, "username", None) or "").casefold())
+            source = (source_by_username.get((getattr(chat, "username", None) or "").casefold())
+                      or source_by_chat_id.get(event.chat_id))
             if not source:
+                return
+            if not source_needed(source):
                 return
             try:
                 item = await TelegramCollector(source, client).from_message(event.message)
@@ -180,23 +296,26 @@ async def main():
             except Exception:
                 log.exception("telegram_event_failed source=%s", source.key)
 
-    tasks = [asyncio.create_task(retry_loop(bot))]
-    for source in sources:
-        if source.kind == "telegram" and client is None:
-            continue
-        tasks.append(asyncio.create_task(source_loop(source, bot, client, redis_client)))
+    source_tasks: dict[int, asyncio.Task] = {}
+    tasks = [asyncio.create_task(retry_loop(bot)),
+             asyncio.create_task(source_registry_loop(bot, client, redis_client, source_tasks,
+                                                      source_by_username, source_by_chat_id))]
     if client:
-        tasks.append(asyncio.create_task(client.run_until_disconnected()))
+        tasks.append(asyncio.create_task(maintain_telegram_connection(client)))
     dispatcher = create_dispatcher()
 
     async def on_bot_channel_post(message):
         username = (getattr(message.chat, "username", None) or "").casefold()
-        source = source_by_username.get(username)
+        source = source_by_username.get(username) or source_by_chat_id.get(message.chat.id)
         if not source:
+            return
+        if not source_needed(source):
             return
         item = RuleListingExtractor().extract(message.text or message.caption or "", source_id=source.id,
                                               external_id=str(message.message_id),
-                                              url=f"https://t.me/{source.identifier}/{message.message_id}",
+                                              url=(f"https://t.me/c/{source.identifier[4:]}/{message.message_id}"
+                                                   if source.identifier.startswith("-100") else
+                                                   f"https://t.me/{source.identifier}/{message.message_id}"),
                                               region=source.region)
         if item:
             item.published_at = message.date
@@ -209,9 +328,9 @@ async def main():
     try:
         await dispatcher.start_polling(bot, allowed_updates=["message", "callback_query", "channel_post", "edited_channel_post"])
     finally:
-        for task in tasks:
+        for task in [*tasks, *source_tasks.values()]:
             task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.gather(*tasks, *source_tasks.values(), return_exceptions=True)
         if client:
             await client.disconnect()
         await redis_client.aclose()

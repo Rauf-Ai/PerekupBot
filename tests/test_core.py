@@ -12,7 +12,7 @@ from app.collectors.apify import ApifyAdapter
 from app.collectors.autoru import AutoRuCollector
 from app.collectors.drom import DromCollector
 from app.collectors.telegram import TelegramCollector
-from app.bot.handlers import AdminMiddleware
+from app.bot.handlers import UserAccessMiddleware
 from app.extractors.rules import RuleListingExtractor
 from app.schemas.listing import ListingInput
 from app.services.normalization import normalize_listing
@@ -31,7 +31,8 @@ class CoreTests(unittest.TestCase):
         with self.sessions.begin() as db:
             source = Source(key="test", kind="mock", identifier="test", region="Татарстан", config={})
             user = User(telegram_id=123)
-            user.filters = UserFilter(max_price=200000, regions=["Татарстан", "Чувашия", "Марий Эл"])
+            user.filters = UserFilter(max_price=200000, regions=["Татарстан", "Чувашия", "Марий Эл"],
+                                      selected_sources=["mock"])
             db.add_all([source, user])
             db.flush()
             self.source_id = source.id
@@ -214,8 +215,10 @@ class CoreTests(unittest.TestCase):
             calls.append(event.from_user.id)
             return "ok"
 
-        middleware = AdminMiddleware()
-        with patch("app.bot.handlers.get_settings", return_value=SimpleNamespace(telegram_admin_id=123)):
+        middleware = UserAccessMiddleware()
+        with (patch("app.bot.handlers.get_settings", return_value=SimpleNamespace(
+                telegram_admin_id=123, telegram_admin_ids="")),
+              patch("app.bot.handlers.SessionLocal", self.sessions)):
             rejected = asyncio.run(middleware(handler, SimpleNamespace(from_user=SimpleNamespace(id=999)), {}))
             accepted = asyncio.run(middleware(handler, SimpleNamespace(from_user=SimpleNamespace(id=123)), {}))
         self.assertIsNone(rejected)

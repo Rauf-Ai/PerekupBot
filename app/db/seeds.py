@@ -12,7 +12,7 @@ def seed_sources() -> None:
     with SessionLocal.begin() as db:
         configured_keys = {item["key"] for item in definitions}
         for stored in db.scalars(select(Source)).all():
-            if stored.key not in configured_keys:
+            if stored.key not in configured_keys and not (stored.config or {}).get("custom"):
                 stored.enabled = False
         for item in definitions:
             source = db.scalar(select(Source).where(Source.key == item["key"]))

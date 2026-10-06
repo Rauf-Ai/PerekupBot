@@ -3,12 +3,13 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from sqlalchemy import or_, select
 from sqlalchemy.orm import selectinload
-from app.db.models import Listing, ListingAlias, ListingPhoto, Notification, PriceHistory, Source, User, UserFilter
+from app.db.models import Listing, ListingAlias, ListingPhoto, Notification, PriceHistory, Source, User, UserFilter, UserTelegramSource
 from app.db.session import SessionLocal
 from app.config.settings import get_settings
 from app.schemas.listing import ListingInput
 from app.services.deduplication import find_duplicate
 from app.services.filtering import matches_filter
+from app.services.custom_sources import custom_source_limit
 from app.services.normalization import normalize_listing
 
 log = logging.getLogger(__name__)
@@ -63,7 +64,11 @@ def ingest(item: ListingInput) -> IngestResult:
             elif old_price is not None and listing.price < old_price:
                 event_key = f"price:{history.id}"
         if event_key:
-            source_kind = db.scalar(select(Source.kind).where(Source.id == item.source_id))
+            source = db.get(Source, item.source_id)
+            source_kind = source.kind
+            is_custom_source = bool((source.config or {}).get("custom"))
+            subscriber_ids = (set(db.scalars(select(UserTelegramSource.user_id).where(
+                UserTelegramSource.source_id == source.id)).all()) if is_custom_source else set())
             settings = get_settings()
             admin_ids = {settings.telegram_admin_id} if settings.telegram_admin_id is not None else set()
             admin_ids.update(int(value.strip()) for value in settings.telegram_admin_ids.split(",")
@@ -81,6 +86,8 @@ def ingest(item: ListingInput) -> IngestResult:
             filters = user.filters
             if (filters and filters.search_enabled and
                     source_kind in (filters.selected_sources or ["telegram", "avito", "autoru", "drom"]) and
+                    (not is_custom_source or (user.id in subscriber_ids and custom_source_limit(
+                        user.subscription_plan, is_admin=user.telegram_id in admin_ids))) and
                     matches_filter(listing, filters)):
                 notification = Notification(user_id=user.id, listing_id=listing.id, event_key=event_key, created_at=now)
                 db.add(notification)
